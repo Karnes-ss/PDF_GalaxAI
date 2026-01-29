@@ -82,6 +82,33 @@ npm run dev
 前端已配置代理：
 - `/api/*` 与 `/files/*` -> `http://127.0.0.1:8000`
 
+## 快速开始（macOS）
+
+### macOS（Homebrew）
+
+```bash
+# 首次安装依赖（已安装可跳过）
+brew --version >/dev/null 2>&1 || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install python node
+
+cd /path/to/PDF_GalaxAI
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r ./backend/requirements.txt
+
+cd backend
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+另开终端启动前端：
+
+```bash
+cd /path/to/PDF_GalaxAI
+npm install
+npm run dev
+```
+
 ## 数据与导入 PDF
 
 后端默认数据目录：
