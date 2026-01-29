@@ -64,7 +64,7 @@ py -m pip install -r .\backend\requirements.txt
 # 启动后端（等价于：cd backend && py -m uvicorn main:app --reload --host 127.0.0.1 --port 8000）
 npm run backend
 ```
-
+kkkk
 健康检查：
 - http://127.0.0.1:8000/api/health
 
