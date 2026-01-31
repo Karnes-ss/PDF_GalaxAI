@@ -1,170 +1,205 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useState, useMemo } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, Html, Line, Stars } from '@react-three/drei';
+import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { Edge, Paper } from '../types/scholar';
 
+// --- 连线组件：科技感渐变与交互 ---
+function EdgeConnection({ from, to }: { from: Paper; to: Paper }) {
+  const [hovered, setHover] = useState(false);
+  
+  // 预计算颜色对象
+  const colors = useMemo(() => {
+    return [new THREE.Color(from.color), new THREE.Color(to.color)];
+  }, [from.color, to.color]);
+
+  return (
+    <group>
+      {/* 1. 可见线：极简渐变，悬停时高亮并发光 */}
+      <Line
+        points={[from.pos, to.pos]}
+        vertexColors={colors}
+        lineWidth={hovered ? 3 : 1} // 悬停变粗
+        transparent
+        opacity={hovered ? 1.0 : 0.2} // 平时低透明度，悬停完全不透明
+        depthWrite={false}
+        toneMapped={false} // 允许颜色溢出产生辉光
+      />
+      
+      {/* 2. 交互热区：不可见的粗线，用于捕捉鼠标事件 */}
+      <Line
+        points={[from.pos, to.pos]}
+        lineWidth={12} // 增加点击范围
+        transparent
+        opacity={0} // 完全透明
+        onPointerOver={(e) => {
+          e.stopPropagation(); // 防止穿透
+          setHover(true);
+        }}
+        onPointerOut={() => setHover(false)}
+      />
+    </group>
+  );
+}
+
+// --- 核心渲染组件：渐变发光星球 ---
+function PaperNode({ 
+  paper, 
+  isHighlighted, 
+  onSelect,
+  hideLabels
+}: { 
+  paper: Paper; 
+  isHighlighted: boolean; 
+  onSelect: (p: Paper) => void;
+  hideLabels?: boolean;
+}) {
+  const [hovered, setHover] = useState(false);
+  const position = useMemo(() => new THREE.Vector3(...paper.pos), [paper.pos]);
+
+  // 根据选中或悬停状态计算颜色和强度
+  const baseColor = isHighlighted ? '#fbbf24' : paper.color;
+  const glowIntensity = hovered || isHighlighted ? 2.8 : 0.8;
+
+  return (
+    <group position={position}>
+      {/* 1. 核心球体：使用物理材质并开启自发光 */}
+      <mesh 
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect(paper);
+        }}
+        onPointerOver={() => setHover(true)}
+        onPointerOut={() => setHover(false)}
+      >
+        <sphereGeometry args={[0.27, 32, 32]} />
+        <meshStandardMaterial 
+          color={baseColor}
+          emissive={baseColor}
+          emissiveIntensity={glowIntensity}
+          roughness={0.2}
+          metalness={0.8}
+          toneMapped={false}
+        />
+      </mesh>
+
+      {/* 2. 渐变外壳：通过增加一个略大的半透明球体模拟大气渐变层 */}
+      <mesh scale={[1.2, 1.2, 1.2]}>
+        <sphereGeometry args={[0.27, 32, 32]} />
+        <meshBasicMaterial 
+          color={baseColor}
+          transparent
+          opacity={0.15}
+          blending={THREE.AdditiveBlending}
+          side={THREE.BackSide}
+        />
+      </mesh>
+
+      {/* 3. 科技感文字标签 */}
+      {!hideLabels && (
+        <Html distanceFactor={15} position={[0, 0.9, 0]} center>
+          <div style={{
+            pointerEvents: 'none',
+            background: hovered ? 'rgba(2, 6, 12, 0.9)' : 'rgba(2, 6, 12, 0.4)',
+            color: 'white',
+            padding: '4px 12px',
+            borderRadius: '4px',
+            fontSize: '12px',
+            fontWeight: 500,
+            border: `1px solid ${baseColor}`,
+            whiteSpace: 'nowrap',
+            boxShadow: hovered ? `0 0 20px ${baseColor}` : `0 0 10px ${baseColor}33`,
+            backdropFilter: 'blur(6px)',
+            transition: 'all 0.4s cubic-bezier(0.23, 1, 0.32, 1)',
+            opacity: hovered || isHighlighted ? 1 : 0.7,
+          }}>
+            {paper.displayTitle || paper.title}
+          </div>
+        </Html>
+      )}
+    </group>
+  );
+}
+
+// --- 主渲染组件 ---
 export function GalaxyRenderer({
   papers,
   edges,
   onSelect,
   highlights,
+  hideLabels,
 }: {
   papers: Paper[];
   edges: Edge[];
   onSelect: (p: Paper) => void;
   highlights: string[];
+  hideLabels?: boolean;
 }) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const raycaster = new THREE.Raycaster();
-  const mouse = new THREE.Vector2();
+  const highlightSet = useMemo(() => new Set(highlights), [highlights]);
 
-  useEffect(() => {
-    if (!mountRef.current) return;
+  return (
+    <div style={{ width: '100%', height: '100%', background: '#010204', position: 'relative' }}>
+      <Canvas 
+        camera={{ position: [0, 0, 60], fov: 50 }}
+        gl={{ 
+          antialias: true, 
+          toneMapping: THREE.ReinhardToneMapping,
+          powerPreference: "high-performance" 
+        }}
+      >
+        <color attach="background" args={['#010204']} />
+        
+        {/* 背景氛围 */}
+        <Stars radius={150} depth={50} count={5000} factor={4} saturation={0.5} fade speed={1.5} />
+        <ambientLight intensity={0.2} />
+        <pointLight position={[20, 20, 20]} intensity={1.5} color="#ffffff" />
 
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(
-      60,
-      mountRef.current.offsetWidth / mountRef.current.offsetHeight,
-      0.1,
-      1000
-    );
+        {/* 渲染连接线：使用自定义组件实现科技感交互 */}
+        {edges.map((edge, i) => {
+          const from = papers.find(p => p.id === edge.source);
+          const to = papers.find(p => p.id === edge.target);
+          if (!from || !to) return null;
+          
+          return (
+            <EdgeConnection 
+              key={`edge-${i}`}
+              from={from}
+              to={to}
+            />
+          );
+        })}
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setSize(mountRef.current.offsetWidth, mountRef.current.offsetHeight);
-    mountRef.current.appendChild(renderer.domElement);
+        {/* 渲染节点 */}
+        {papers.map((paper) => (
+          <PaperNode 
+            key={paper.id} 
+            paper={paper} 
+            isHighlighted={highlightSet.has(paper.id)}
+            onSelect={onSelect}
+            hideLabels={hideLabels}
+          />
+        ))}
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
+        {/* 交互控制 */}
+        <OrbitControls 
+          enableDamping 
+          dampingFactor={0.05} 
+          rotateSpeed={0.7}
+          minDistance={10}
+          maxDistance={200}
+        />
 
-    const idToPos = new Map<string, [number, number, number]>();
-    for (const p of papers) idToPos.set(p.id, p.pos);
-
-    const starGeo = new THREE.BufferGeometry();
-    const starPos = new Float32Array(5000 * 3);
-    for (let i = 0; i < 15000; i++) starPos[i] = (Math.random() - 0.5) * 100;
-    starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
-    const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.02, transparent: true, opacity: 0.4 });
-    scene.add(new THREE.Points(starGeo, starMat));
-
-    const edgePositions: number[] = [];
-    const edgeColors: number[] = [];
-    for (const e of edges) {
-      const a = idToPos.get(e.source);
-      const b = idToPos.get(e.target);
-      if (!a || !b) continue;
-      edgePositions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
-      const base = e.type === 'bridge' ? '#f472b6' : '#60a5fa';
-      const c = new THREE.Color(base).multiplyScalar(Math.min(1, 0.35 + e.weight * 0.12));
-      edgeColors.push(c.r, c.g, c.b, c.r, c.g, c.b);
-    }
-
-    const edgeGeo = new THREE.BufferGeometry();
-    edgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-    edgeGeo.setAttribute('color', new THREE.Float32BufferAttribute(edgeColors, 3));
-    const edgeMat = new THREE.LineBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.18,
-      depthWrite: false,
-    });
-    const edgeLines = new THREE.LineSegments(edgeGeo, edgeMat);
-    scene.add(edgeLines);
-
-    const sphereGeo = new THREE.SphereGeometry(0.14, 16, 16);
-    const sphereMat = new THREE.MeshBasicMaterial();
-    const mesh = new THREE.InstancedMesh(sphereGeo, sphereMat, papers.length);
-    const dummy = new THREE.Object3D();
-
-    scene.add(mesh);
-
-    camera.position.set(0, 0, 15);
-
-    const highlightSet = new Set(highlights);
-
-    const flyTo = (target: THREE.Vector3) => {
-      const startCam = camera.position.clone();
-      const startTgt = controls.target.clone();
-      const endTgt = target.clone();
-      const endCam = target.clone().add(new THREE.Vector3(0, 0, 6));
-      const start = performance.now();
-      const durationMs = 550;
-
-      const step = (now: number) => {
-        const t = Math.min(1, (now - start) / durationMs);
-        const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-        camera.position.lerpVectors(startCam, endCam, k);
-        controls.target.lerpVectors(startTgt, endTgt, k);
-        controls.update();
-        if (t < 1) requestAnimationFrame(step);
-      };
-      requestAnimationFrame(step);
-    };
-
-    const onPointerDown = (e: MouseEvent) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-      raycaster.setFromCamera(mouse, camera);
-      const intersects = raycaster.intersectObject(mesh);
-      if (intersects.length > 0) {
-        const id = intersects[0].instanceId;
-        if (id !== undefined) {
-          const p = papers[id];
-          onSelect(p);
-          flyTo(new THREE.Vector3(p.pos[0], p.pos[1], p.pos[2]));
-        }
-      }
-    };
-
-    renderer.domElement.addEventListener('mousedown', onPointerDown);
-
-    let raf = 0;
-    const animate = () => {
-      raf = requestAnimationFrame(animate);
-      controls.update();
-
-      const t = performance.now() / 1000;
-      for (let i = 0; i < papers.length; i++) {
-        const p = papers[i];
-        const isHi = highlightSet.has(p.id);
-        const s = isHi ? 1 + 0.35 * Math.sin(t * 5 + i * 0.2) : 1;
-        dummy.position.set(p.pos[0], p.pos[1], p.pos[2]);
-        dummy.scale.setScalar(s);
-        dummy.updateMatrix();
-        mesh.setMatrixAt(i, dummy.matrix);
-        mesh.setColorAt(i, new THREE.Color(isHi ? '#fbbf24' : p.color));
-      }
-      mesh.instanceMatrix.needsUpdate = true;
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    const onResize = () => {
-      if (!mountRef.current) return;
-      camera.aspect = mountRef.current.offsetWidth / mountRef.current.offsetHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(mountRef.current.offsetWidth, mountRef.current.offsetHeight);
-    };
-    window.addEventListener('resize', onResize);
-
-    return () => {
-      window.removeEventListener('resize', onResize);
-      renderer.domElement.removeEventListener('mousedown', onPointerDown);
-      cancelAnimationFrame(raf);
-      edgeGeo.dispose();
-      edgeMat.dispose();
-      sphereGeo.dispose();
-      sphereMat.dispose();
-      mesh.dispose();
-      starGeo.dispose();
-      starMat.dispose();
-      renderer.dispose();
-      mountRef.current?.removeChild(renderer.domElement);
-    };
-  }, [papers, edges, highlights, onSelect]);
-
-  return <div ref={mountRef} className="w-full h-full" />;
+        {/* 关键渲染步骤：辉光后期处理 */}
+        <EffectComposer disableNormalPass>
+          <Bloom 
+            luminanceThreshold={0.15} 
+            intensity={1.8} 
+            mipmapBlur 
+            radius={0.3} 
+          />
+        </EffectComposer>
+      </Canvas>
+    </div>
+  );
 }

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+# 设置 HF 镜像以解决国内连接问题
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import uuid
 from threading import Lock
 from typing import Any
@@ -67,6 +70,18 @@ class ScholarStore:
         display_title = safe_stem(filename)
         title = extract_title_from_text(cleaned, display_title)
         abstract = extract_abstract_block(cleaned)
+        
+        # 提取第一句话
+        first_sentence = ""
+        if cleaned:
+            # 简单的分句逻辑：查找第一个句号、问号或感叹号
+            import re
+            match = re.search(r'[^.!?。！？]+[.!?。！？]', cleaned)
+            if match:
+                first_sentence = match.group(0).strip()
+            else:
+                first_sentence = cleaned[:100].strip() + "..."
+        
         keywords = extract_keywords_block(cleaned)
         if not keywords:
             keywords = tfidf_keywords_block(f"{title}\n{abstract}")
@@ -75,6 +90,7 @@ class ScholarStore:
             "title": title,
             "display_title": display_title,
             "abstract": abstract,
+            "first_sentence": first_sentence,
             "keywords": keywords,
             "filename": filename,
         }

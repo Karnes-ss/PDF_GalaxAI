@@ -2,6 +2,7 @@ export type Paper = {
   id: string;
   title: string;
   displayTitle?: string;
+  firstSentence?: string;
   pos: [number, number, number];
   color: string;
   category: string;
