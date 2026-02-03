@@ -54,6 +54,7 @@ def create_app(store) -> FastAPI:
                         "id": paper_id,
                         "title": p.get("title", ""),
                         "displayTitle": p.get("display_title") or safe_stem(str(p.get("filename") or "")),
+                        "firstSentence": p.get("first_sentence") or p.get("abstract", "")[:100] or "No content available.",
                         "pos": (float(pos[0]), float(pos[1]), float(pos[2])),
                         "color": p.get("color", cluster_palette()[0]),
                         "category": p.get("category") or p.get("field") or "User Upload",
@@ -73,7 +74,7 @@ def create_app(store) -> FastAPI:
                     order = np.argsort(sims[i])[::-1][:topk]
                     for j in order:
                         w = float(sims[i, j])
-                        if w < 0.28:
+                        if w < 0.15:
                             continue
                         dst = str(store._papers[int(j)].get("id") or "")
                         a, b = (src, dst) if src <= dst else (dst, src)

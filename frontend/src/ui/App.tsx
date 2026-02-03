@@ -103,6 +103,7 @@ export function App() {
           edges={edges}
           onSelect={(p) => setSelectedPaper(p)}
           highlights={chat[chat.length - 1]?.cites || []}
+          hideLabels={!!readerPaper}
         />
 
         {/* 悬浮预览窗口 */}
@@ -115,8 +116,17 @@ export function App() {
           return (
             <div className="absolute bottom-10 left-10 w-96 glass rounded-2xl p-6 border-l-4 animate-in fade-in slide-in-from-left-4 z-40" style={{ borderColor: selectedPaper.color }}>
               <div className="flex justify-between items-start mb-4">
-                <h3 className="font-bold text-lg leading-tight">{selectedPaper.displayTitle || selectedPaper.title}</h3>
-                <button onClick={() => setSelectedPaper(null)}>
+                <div className="flex-1 mr-2 overflow-hidden">
+                  <h3 className="font-bold text-lg leading-tight truncate" title={selectedPaper.title || selectedPaper.displayTitle}>
+                    {selectedPaper.title || selectedPaper.displayTitle}
+                  </h3>
+                  {selectedPaper.firstSentence && (
+                    <p className="text-xs text-slate-400 mt-2 line-clamp-3 italic">
+                      "{selectedPaper.firstSentence}"
+                    </p>
+                  )}
+                </div>
+                <button onClick={() => setSelectedPaper(null)} className="shrink-0">
                   <X className="w-5 h-5 text-slate-500" />
                 </button>
               </div>
