@@ -23,7 +23,7 @@ export function App() {
         setPapers(g.papers);
         setEdges(g.edges);
       } catch {
-        setChat((prev) => [...prev, { role: 'ai', text: '未连接到本地后端：请先启动 backend（FastAPI/uvicorn）。' }]);
+        setChat((prev) => [...prev, { role: 'ai', text: '⚠️ 未连接到本地后端：请确保 server.py 正在运行 (端口 8000)。' }]);
       }
     })();
   }, []);
@@ -38,9 +38,9 @@ export function App() {
       const g = await fetchGraph();
       setPapers(g.papers);
       setEdges(g.edges);
-      setChat((prev) => [...prev, { role: 'ai', text: `成功接入文献: ${fileName}。已完成空间映射与关键词连边。` }]);
+      setChat((prev) => [...prev, { role: 'ai', text: `✅ 成功接入文献: ${fileName}。已完成空间映射与关键词连边。` }]);
     } catch {
-      setChat((prev) => [...prev, { role: 'ai', text: '上传失败：请检查 backend 是否启动，以及是否安装了依赖。' }]);
+      setChat((prev) => [...prev, { role: 'ai', text: '❌ 上传失败：请检查后端日志。' }]);
     } finally {
       setLoading(false);
       e.target.value = '';
@@ -48,21 +48,29 @@ export function App() {
   };
 
   const handleSend = async () => {
-    if (!input) return;
+    if (!input.trim()) return;
     const msg = input;
     setInput('');
+    
+    // 立即显示用户消息
     setChat((prev) => [...prev, { role: 'user', text: msg }]);
     setLoading(true);
 
     try {
+      // 调用 client.ts 中的 queryLocal (它会请求后端 api.py)
       const res = await queryLocal(msg);
+      
+      const answer = res.answer || 'AI 未返回内容';
+      // 兼容两种引用格式：后端返回的 cites 数组 或 文本中的 [CITE:id] 标记
       const cites =
         res.cites ||
-        res.answer?.match(/\[CITE:(\w+)\]/g)?.map((c) => c.replace('[CITE:', '').replace(']', '')) ||
+        answer.match(/\[CITE:(\w+)\]/g)?.map((c) => c.replace('[CITE:', '').replace(']', '')) ||
         [];
-      setChat((prev) => [...prev, { role: 'ai', text: res.answer || '', cites }]);
-    } catch {
-      setChat((prev) => [...prev, { role: 'ai', text: '检索失败：请检查 backend 是否启动。' }]);
+        
+      setChat((prev) => [...prev, { role: 'ai', text: answer, cites }]);
+    } catch (err) {
+      console.error(err);
+      setChat((prev) => [...prev, { role: 'ai', text: '❌ 检索失败：请检查后端连接或 API Key 配置。' }]);
     } finally {
       setLoading(false);
     }
@@ -106,47 +114,91 @@ export function App() {
           hideLabels={!!readerPaper}
         />
 
-        {/* 悬浮预览窗口 */}
+// ... (保留上面的 import 和前面的代码)
+
+        {/* 悬浮详情浮窗 (升级版) */}
         {selectedPaper && (() => {
           const linked = edges.filter((e) => e.source === selectedPaper.id || e.target === selectedPaper.id);
           const linkCount = linked.length;
-          const maxW = linked.reduce((m, e) => Math.max(m, Number(e.weight) || 0), 0);
-          const relatedness = Math.min(100, Math.round((maxW / 8) * 100));
-
+          
           return (
-            <div className="absolute bottom-10 left-10 w-96 glass rounded-2xl p-6 border-l-4 animate-in fade-in slide-in-from-left-4 z-40" style={{ borderColor: selectedPaper.color }}>
-              <div className="flex justify-between items-start mb-4">
-                <div className="flex-1 mr-2 overflow-hidden">
-                  <h3 className="font-bold text-lg leading-tight truncate" title={selectedPaper.title || selectedPaper.displayTitle}>
-                    {selectedPaper.title || selectedPaper.displayTitle}
+            <div 
+              className="absolute bottom-10 left-10 w-[420px] glass rounded-2xl p-6 border-l-4 animate-in fade-in slide-in-from-left-4 z-40 flex flex-col gap-4 shadow-2xl shadow-black/50" 
+              style={{ borderColor: selectedPaper.color }}
+            >
+              {/* 头部：标题与关闭 */}
+              <div className="flex justify-between items-start">
+                <div className="flex-1 mr-4">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span 
+                      className="text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider text-black/80"
+                      style={{ backgroundColor: selectedPaper.color }}
+                    >
+                      {selectedPaper.field}
+                    </span>
+                    <span className="text-[10px] text-slate-500 font-mono">
+                      CONF: {(selectedPaper.confidence * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <h3 className="font-bold text-lg leading-tight text-white/90" title={selectedPaper.title}>
+                    {selectedPaper.displayTitle}
                   </h3>
-                  {selectedPaper.firstSentence && (
-                    <p className="text-xs text-slate-400 mt-2 line-clamp-3 italic">
-                      "{selectedPaper.firstSentence}"
-                    </p>
-                  )}
                 </div>
-                <button onClick={() => setSelectedPaper(null)} className="shrink-0">
-                  <X className="w-5 h-5 text-slate-500" />
+                <button 
+                  onClick={() => setSelectedPaper(null)} 
+                  className="shrink-0 p-1 hover:bg-white/10 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-slate-400" />
                 </button>
               </div>
-              <div className="flex gap-4 mb-6">
-                <div className="text-xs text-slate-400 flex items-center gap-1">
-                  <BookOpen className="w-3 h-3" /> 连线: {linkCount}
-                </div>
-                <div className="text-xs text-slate-400 flex items-center gap-1">
-                  <Activity className="w-3 h-3" /> 关联度: {relatedness}%
-                </div>
+
+              {/* 摘要区域 (可滚动) */}
+              <div className="bg-black/20 rounded-xl p-3 max-h-[120px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap">
+                  {selectedPaper.abstract || selectedPaper.firstSentence || "暂无摘要内容..."}
+                </p>
               </div>
-              <button
-                onClick={() => setReaderPaper(selectedPaper)}
-                className="w-full bg-blue-600 py-2 rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:bg-blue-500 transition-colors"
-              >
-                <FileText className="w-4 h-4" /> 进入上帝视角阅读
-              </button>
+
+              {/* 关键词标签 */}
+              {selectedPaper.keywords && selectedPaper.keywords.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {selectedPaper.keywords.slice(0, 5).map((kw, i) => (
+                    <span 
+                      key={i} 
+                      className="text-[10px] px-2 py-1 rounded bg-white/5 border border-white/10 text-slate-300"
+                    >
+                      #{kw}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* 底部数据栏 */}
+              <div className="flex items-center justify-between pt-2 border-t border-white/10">
+                <div className="flex gap-4">
+                  <div className="text-xs text-slate-400 flex items-center gap-1.5" title="关联连线数">
+                    <BookOpen className="w-3 h-3 text-indigo-400" /> 
+                    <span className="font-mono">{linkCount}</span>
+                  </div>
+                  <div className="text-xs text-slate-400 flex items-center gap-1.5" title="文件类型">
+                    <FileText className="w-3 h-3 text-emerald-400" />
+                    <span className="font-mono">PDF</span>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => setReaderPaper(selectedPaper)}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold px-4 py-2 rounded-lg transition-all flex items-center gap-2 shadow-lg shadow-indigo-600/20 active:scale-95"
+                >
+                  <Search className="w-3 h-3" />
+                  深度阅读
+                </button>
+              </div>
             </div>
           );
         })()}
+
+// ... (保留后面的 readerPaper 和 return 结束代码)
 
         {readerPaper && (
           <div className="absolute inset-0 z-[60] bg-black/70 p-6">
@@ -181,7 +233,7 @@ export function App() {
             <Sparkles className="w-4 h-4 text-yellow-400" /> 本地检索终端
           </h2>
           <div className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full border border-green-500/30">
-          RAG 
+            RAG ACTIVE
           </div>
         </div>
 
@@ -189,7 +241,7 @@ export function App() {
           {chat.map((m, i) => (
             <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div
-                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed ${
+                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
                   m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-white/5 border border-white/10'
                 }`}
               >
@@ -202,7 +254,7 @@ export function App() {
                         onClick={() => setSelectedPaper(papers.find((p) => p.id === cid) || null)}
                         className="text-[10px] bg-yellow-500/10 text-yellow-500 border border-yellow-500/30 px-2 py-0.5 rounded hover:bg-yellow-500/20 transition-all"
                       >
-                        证据文献 #{cid}
+                        证据文献 #{cid.slice(0, 4)}
                       </button>
                     ))}
                   </div>
@@ -230,7 +282,8 @@ export function App() {
             />
             <button
               onClick={handleSend}
-              className="absolute bottom-4 right-4 p-2 bg-indigo-600 rounded-xl hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 transition-all active:scale-95"
+              disabled={loading}
+              className="absolute bottom-4 right-4 p-2 bg-indigo-600 rounded-xl hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Send className="w-4 h-4 text-white" />
             </button>

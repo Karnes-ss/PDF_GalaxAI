@@ -28,7 +28,8 @@ export async function queryLocal(prompt: string): Promise<QueryResponse> {
   const r = await fetch(apiUrl('/api/query'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: prompt }),
+    // ⚠️ CRITICAL CHANGE: 后端 api.py 中的 ChatBody 定义字段为 'question'，必须匹配
+    body: JSON.stringify({ question: prompt }),
   });
   if (!r.ok) throw new Error(`POST /api/query failed: ${r.status}`);
   return r.json();
