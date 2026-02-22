@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from 'react';
-import { Canvas } from '@react-three/fiber';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, Html, Line, Stars } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
@@ -129,14 +129,69 @@ export function GalaxyRenderer({
   onSelect,
   highlights,
   hideLabels,
+  focusTarget,
 }: {
   papers: Paper[];
   edges: Edge[];
   onSelect: (p: Paper) => void;
   highlights: string[];
   hideLabels?: boolean;
+  focusTarget?: Paper | null;
 }) {
   const highlightSet = useMemo(() => new Set(highlights), [highlights]);
+  // Camera & controls refs
+  const controlsRef = useRef<any>(null);
+
+  // Camera animator must run inside the Canvas render context, so define a small component
+  function CameraAnimator({ focus }: { focus?: Paper | null }) {
+    const { camera } = useThree();
+    const animRef = useRef<number | null>(null);
+    const startRef = useRef<{ from: THREE.Vector3; to: THREE.Vector3; targetFrom: THREE.Vector3; targetTo: THREE.Vector3; startTime: number; duration: number } | null>(null);
+
+    useEffect(() => {
+      if (!focus) return;
+      const targetPos = new THREE.Vector3(...focus.pos);
+      const offset = new THREE.Vector3(0, 0, 18 + (focus.size || 0));
+      const desiredCam = targetPos.clone().add(offset);
+
+      const from = camera.position.clone();
+      const to = desiredCam;
+      const targetFrom = controlsRef.current ? controlsRef.current.target.clone() : new THREE.Vector3(0, 0, 0);
+      const targetTo = targetPos.clone();
+      const duration = 600;
+      startRef.current = { from, to, targetFrom, targetTo, startTime: performance.now(), duration };
+
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+
+      const step = () => {
+        if (!startRef.current) return;
+        const now = performance.now();
+        const t = Math.min(1, (now - startRef.current.startTime) / startRef.current.duration);
+        const ease = t * (2 - t);
+        camera.position.lerpVectors(startRef.current.from, startRef.current.to, ease);
+        if (controlsRef.current) {
+          const newTarget = startRef.current.targetFrom.clone().lerp(startRef.current.targetTo, ease);
+          controlsRef.current.target.copy(newTarget);
+          controlsRef.current.update();
+        }
+
+        if (t < 1) {
+          animRef.current = requestAnimationFrame(step);
+        } else {
+          startRef.current = null;
+          animRef.current = null;
+        }
+      };
+
+      animRef.current = requestAnimationFrame(step);
+      return () => {
+        if (animRef.current) cancelAnimationFrame(animRef.current);
+        animRef.current = null;
+      };
+    }, [focus]);
+
+    return null;
+  }
 
   return (
     <div style={{ width: '100%', height: '100%', background: '#010204', position: 'relative' }}>
@@ -154,6 +209,9 @@ export function GalaxyRenderer({
         <Stars radius={150} depth={50} count={5000} factor={4} saturation={0.5} fade speed={1.5} />
         <ambientLight intensity={0.2} />
         <pointLight position={[20, 20, 20]} intensity={1.5} color="#ffffff" />
+
+        {/* Camera animator listens to focusTarget and performs fly-to */}
+        <CameraAnimator focus={focusTarget} />
 
         {/* 渲染连接线：使用自定义组件实现科技感交互 */}
         {edges.map((edge, i) => {
@@ -183,6 +241,7 @@ export function GalaxyRenderer({
 
         {/* 交互控制 */}
         <OrbitControls 
+          ref={controlsRef}
           enableDamping 
           dampingFactor={0.05} 
           rotateSpeed={0.7}
