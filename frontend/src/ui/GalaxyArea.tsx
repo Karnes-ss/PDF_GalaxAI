@@ -1,6 +1,6 @@
 import React from 'react';
 import { Search } from 'lucide-react';
-import { GalaxyRenderer } from '../../rendering/GalaxyRenderer';
+import { GalaxyRenderer } from '../rendering/GalaxyRenderer';
 import type { Edge, Paper } from '../types/scholar';
 
 interface Props {
