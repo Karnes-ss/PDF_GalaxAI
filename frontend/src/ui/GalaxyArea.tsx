@@ -6,7 +6,7 @@ import type { Edge, Paper } from '../types/scholar';
 interface Props {
   papers: Paper[];
   edges: Edge[];
-  onSelect: (p: Paper) => void;
+  onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
   highlights?: string[];
   hideLabels?: boolean;
   searchText: string;
@@ -14,9 +14,12 @@ interface Props {
   results: Paper[];
   onResultClick: (p: Paper) => void;
   focusTarget?: Paper | null;
+  highlightedSearchPaperId?: string | null;
+  htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
 }
 
-export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLabels, searchText, setSearchText, results, onResultClick, focusTarget }: Props) {
+export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLabels, searchText, setSearchText, results, onResultClick, focusTarget, highlightedSearchPaperId, htmlPortalTargetRef }: Props) {
+  const combinedHighlights = Array.from(new Set([...(highlights || []), ...(highlightedSearchPaperId ? [highlightedSearchPaperId] : [])]));
   return (
     <main className="flex-1 relative">
       <div className="absolute top-6 left-6 z-10 flex gap-4">
@@ -51,10 +54,11 @@ export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLa
       <GalaxyRenderer
         papers={papers}
         edges={edges}
-        onSelect={(p) => onSelect(p)}
-        highlights={highlights || []}
+        onSelect={(p, screenPos) => onSelect(p, screenPos)}
+        highlights={combinedHighlights}
         hideLabels={!!hideLabels}
         focusTarget={focusTarget}
+        htmlPortalTargetRef={htmlPortalTargetRef}
       />
     </main>
   );

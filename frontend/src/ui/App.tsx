@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Activity, BookOpen, Compass, FileText, Search, Send, Sparkles, Upload, X, Zap } from 'lucide-react';
 import { fetchGraph, fileUrl, queryLocal, uploadPdf } from '../api/client';
 import GalaxyArea from './GalaxyArea';
@@ -12,12 +12,20 @@ export function App() {
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const [readerPaper, setReaderPaper] = useState<Paper | null>(null);
   const [searchText, setSearchText] = useState('');
+  const [highlightedSearchPaperId, setHighlightedSearchPaperId] = useState<string | null>(null);
+  const [selectedPaperScreenPosition, setSelectedPaperScreenPosition] = useState<{ x: number; y: number } | null>(null);
   const [chat, setChat] = useState<{ role: string; text: string; cites?: string[] }[]>([
     { role: 'ai', text: '欢迎进入本地 Scholar 星系。请上传 PDF 文献以生成你的专属知识星云。' },
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const htmlPortalTargetRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    // Some logic if needed
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -102,6 +110,7 @@ export function App() {
 
   const handleSearchSelect = (p: Paper) => {
     setSelectedPaper(p);
+    setHighlightedSearchPaperId(p.id);
     // clear search input to hide dropdown
     setSearchText('');
     // focusTarget is selectedPaper which will be passed into GalaxyArea
@@ -132,7 +141,11 @@ export function App() {
       <GalaxyArea
         papers={papers}
         edges={edges}
-        onSelect={(p) => setSelectedPaper(p)}
+        onSelect={(p, screenPos) => {
+          setSelectedPaper(p);
+          setSelectedPaperScreenPosition(screenPos);
+          setHighlightedSearchPaperId(null);
+        }}
         highlights={chat[chat.length - 1]?.cites || []}
         hideLabels={!!readerPaper}
         searchText={searchText}
@@ -140,17 +153,25 @@ export function App() {
         results={searchResults}
         onResultClick={handleSearchSelect}
         focusTarget={selectedPaper}
+        highlightedSearchPaperId={highlightedSearchPaperId}
+        htmlPortalTargetRef={htmlPortalTargetRef}
       />
 
       {/* 悬浮详情浮窗（抽离为 PaperDetail） */}
-      {selectedPaper && (
+      {selectedPaper && selectedPaperScreenPosition && (
         <PaperDetail
           selectedPaper={selectedPaper}
           edges={edges}
-          onClose={() => setSelectedPaper(null)}
+          onClose={() => {
+            setSelectedPaper(null);
+            setSelectedPaperScreenPosition(null);
+          }}
           onOpenReader={(p) => setReaderPaper(p)}
+          screenPosition={selectedPaperScreenPosition}
         />
       )}
+
+      <div ref={htmlPortalTargetRef} id="html-portal-target" className="absolute inset-0 pointer-events-none z-0"></div>
 
       {/* 阅读器弹层（抽离为 ReaderModal） */}
       {readerPaper && <ReaderModal readerPaper={readerPaper} onClose={() => setReaderPaper(null)} />}

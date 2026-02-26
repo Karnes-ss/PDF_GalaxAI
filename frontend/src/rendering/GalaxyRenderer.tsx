@@ -44,23 +44,28 @@ function EdgeConnection({ from, to }: { from: Paper; to: Paper }) {
 }
 
 // --- 核心渲染组件：渐变发光星球 ---
-function PaperNode({ 
-  paper, 
-  isHighlighted, 
+function PaperNode({
+  paper,
+  isHighlighted,
   onSelect,
-  hideLabels
-}: { 
-  paper: Paper; 
-  isHighlighted: boolean; 
-  onSelect: (p: Paper) => void;
+  hideLabels,
+  isSelected,
+  htmlPortalTargetRef
+}: {
+  paper: Paper;
+  isHighlighted: boolean;
+  onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
   hideLabels?: boolean;
+  isSelected: boolean;
+  htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
 }) {
+  const { camera, size } = useThree();
   const [hovered, setHover] = useState(false);
   const position = useMemo(() => new THREE.Vector3(...paper.pos), [paper.pos]);
 
   // 根据选中或悬停状态计算颜色和强度
   const baseColor = isHighlighted ? '#fbbf24' : paper.color;
-  const glowIntensity = hovered || isHighlighted ? 2.8 : 0.8;
+  const glowIntensity = hovered || isHighlighted || isSelected ? 15 : 0.8;
 
   return (
     <group position={position}>
@@ -68,7 +73,11 @@ function PaperNode({
       <mesh 
         onClick={(e) => {
           e.stopPropagation();
-          onSelect(paper);
+          // Calculate screen position
+          const vector = position.clone().project(camera);
+          const x = (vector.x * 0.5 + 0.5) * size.width;
+          const y = (-vector.y * 0.5 + 0.5) * size.height;
+          onSelect(paper, { x, y }); // Pass screen position
         }}
         onPointerOver={() => setHover(true)}
         onPointerOut={() => setHover(false)}
@@ -98,7 +107,7 @@ function PaperNode({
 
       {/* 3. 科技感文字标签 */}
       {!hideLabels && (
-        <Html distanceFactor={15} position={[0, 0.9, 0]} center>
+        <Html distanceFactor={15} position={[0, 0.9, 0]} center portal={htmlPortalTargetRef.current || undefined}>
           <div style={{
             pointerEvents: 'none',
             background: hovered ? 'rgba(2, 6, 12, 0.9)' : 'rgba(2, 6, 12, 0.4)',
@@ -130,17 +139,86 @@ export function GalaxyRenderer({
   highlights,
   hideLabels,
   focusTarget,
+  htmlPortalTargetRef,
 }: {
   papers: Paper[];
   edges: Edge[];
-  onSelect: (p: Paper) => void;
+  onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
   highlights: string[];
   hideLabels?: boolean;
   focusTarget?: Paper | null;
+  htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
 }) {
   const highlightSet = useMemo(() => new Set(highlights), [highlights]);
   // Camera & controls refs
   const controlsRef = useRef<any>(null);
+
+  // WASD movement state
+  const moveState = useRef({ forward: false, backward: false, left: false, right: false });
+
+  // Keyboard event listeners for WASD
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      switch (event.code) {
+        case 'KeyW': moveState.current.backward = true; break;
+        case 'KeyS': moveState.current.forward = true; break;
+        case 'KeyA': moveState.current.right = true; break;
+        case 'KeyD': moveState.current.left = true; break;
+      }
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      switch (event.code) {
+        case 'KeyW': moveState.current.backward = false; break;
+        case 'KeyS': moveState.current.forward = false; break;
+        case 'KeyA': moveState.current.right = false; break;
+        case 'KeyD': moveState.current.left = false; break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  // WASD Camera Controls component
+  function WASDControls() {
+    const { camera } = useThree();
+    useFrame((state, delta) => {
+      const moveSpeed = 50 * delta; // Adjust speed as needed
+      const direction = new THREE.Vector3();
+      const frontVector = new THREE.Vector3(0, 0, (moveState.current.backward ? 1 : 0) - (moveState.current.forward ? 1 : 0));
+      const sideVector = new THREE.Vector3((moveState.current.left ? 1 : 0) - (moveState.current.right ? 1 : 0), 0, 0);
+
+      if (controlsRef.current) {
+        // Disable OrbitControls if WASD is active
+        const isMoving = Object.values(moveState.current).some(Boolean);
+        controlsRef.current.enabled = !isMoving;
+      }
+      
+      camera.getWorldDirection(direction);
+      direction.normalize();
+
+      if (frontVector.z !== 0) {
+        camera.position.addScaledVector(direction, frontVector.z * moveSpeed);
+        if (controlsRef.current) controlsRef.current.target.addScaledVector(direction, frontVector.z * moveSpeed);
+      }
+
+      if (sideVector.x !== 0) {
+        const sideDirection = new THREE.Vector3();
+        camera.getWorldDirection(sideDirection);
+        sideDirection.cross(camera.up); // Get right vector
+        sideDirection.normalize();
+        camera.position.addScaledVector(sideDirection, sideVector.x * moveSpeed);
+        if (controlsRef.current) controlsRef.current.target.addScaledVector(sideDirection, sideVector.x * moveSpeed);
+      }
+    });
+    return null;
+  }
 
   // Camera animator must run inside the Canvas render context, so define a small component
   function CameraAnimator({ focus }: { focus?: Paper | null }) {
@@ -213,6 +291,9 @@ export function GalaxyRenderer({
         {/* Camera animator listens to focusTarget and performs fly-to */}
         <CameraAnimator focus={focusTarget} />
 
+        {/* WASD Controls */}
+        <WASDControls />
+
         {/* 渲染连接线：使用自定义组件实现科技感交互 */}
         {edges.map((edge, i) => {
           const from = papers.find(p => p.id === edge.source);
@@ -236,6 +317,8 @@ export function GalaxyRenderer({
             isHighlighted={highlightSet.has(paper.id)}
             onSelect={onSelect}
             hideLabels={hideLabels}
+            isSelected={paper.id === focusTarget?.id}
+            htmlPortalTargetRef={htmlPortalTargetRef}
           />
         ))}
 

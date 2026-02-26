@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { BookOpen, FileText, X, Search } from 'lucide-react';
 import type { Edge, Paper } from '../types/scholar';
 
@@ -7,16 +7,122 @@ interface Props {
   edges: Edge[];
   onClose: () => void;
   onOpenReader: (p: Paper) => void;
+  screenPosition: { x: number; y: number };
+  aiChatWidth: number;
 }
 
-export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReader }: Props) {
+export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReader, screenPosition, aiChatWidth }: Props) {
   const linked = edges.filter((e) => e.source === selectedPaper.id || e.target === selectedPaper.id);
   const linkCount = linked.length;
 
+  const [panelStyle, setPanelStyle] = useState({});
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [startMousePos, setStartMousePos] = useState({ x: 0, y: 0 });
+
+  useEffect(() => {
+    const calculatePosition = () => {
+      const panelWidth = 420;
+      const panelHeight = 300; // Approximate, adjust if needed
+      const aiChatWidthLocal = aiChatWidth; // Use the prop
+      const sphereRadiusPx = 80; // Visual buffer from the sphere center
+      const padding = 10; // Minimum padding from window edges
+
+      const windowWidth = window.innerWidth;
+      const windowHeight = window.innerHeight;
+
+      // Usable area excluding the AI chat
+      const rightUsableEdge = windowWidth - aiChatWidthLocal;
+
+      const offsetFromSphere = 0;20; // Additional buffer to ensure it's not "touching"
+      let finalLeft = screenPosition.x + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
+      let finalTop = screenPosition.y + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
+
+      // --- Boundary adjustments --- 
+
+      // Adjust for left edge
+      if (finalLeft < padding) {
+        finalLeft = padding;
+      }
+
+      // Adjust for top edge
+      if (finalTop < padding) {
+        finalTop = padding;
+      }
+
+      // Adjust for right edge (considering AI chat area)
+      if (finalLeft + panelWidth > rightUsableEdge - padding) {
+        finalLeft = rightUsableEdge - panelWidth - padding;
+      }
+      
+      // Adjust for bottom edge
+      if (finalTop + panelHeight > windowHeight - padding) {
+        finalTop = windowHeight - panelHeight - padding;
+      }
+
+      setPanelStyle({
+        borderColor: selectedPaper.color,
+        left: finalLeft,
+        top: finalTop,
+      });
+    };
+
+    calculatePosition(); // Initial calculation
+    window.addEventListener('resize', calculatePosition); // Recalculate on resize
+    return () => window.removeEventListener('resize', calculatePosition); // Cleanup
+  }, [screenPosition, selectedPaper.color]);
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDragging) return;
+
+      const newLeft = e.clientX - dragOffset.x;
+      const newTop = e.clientY - dragOffset.y;
+
+      // Apply boundary checks to the new position
+      const panelWidth = 420;
+      const panelHeight = 300;
+      const aiChatWidthLocal = aiChatWidth;
+      const padding = 10;
+      const windowWidth = window.innerWidth;
+      const windowHeight = window.innerHeight;
+      const dragRightBoundary = windowWidth; // Allow dragging across the full window width
+
+      let constrainedLeft = Math.max(padding, Math.min(newLeft, dragRightBoundary - panelWidth - padding));
+      let constrainedTop = Math.max(padding, Math.min(newTop, windowHeight - panelHeight - padding));
+
+      setPanelStyle((prevStyle) => ({
+        ...prevStyle,
+        left: constrainedLeft,
+        top: constrainedTop,
+      }));
+    };
+
+    const onMouseUp = () => {
+      setIsDragging(false);
+    };
+
+    if (isDragging) {
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    }
+
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [isDragging, dragOffset, aiChatWidth]);
   return (
     <div
-      className="absolute bottom-10 left-10 w-[420px] glass rounded-2xl p-6 border-l-4 animate-in fade-in slide-in-from-left-4 z-40 flex flex-col gap-4 shadow-2xl shadow-black/50"
-      style={{ borderColor: selectedPaper.color }}
+      className="absolute w-[420px] glass rounded-2xl p-6 border-l-4 animate-in fade-in slide-in-from-left-4 z-40 flex flex-col gap-4 shadow-2xl shadow-black/50"
+      style={{ ...panelStyle, cursor: isDragging ? 'grabbing' : 'grab' }}
+      onMouseDown={(e) => {
+        setIsDragging(true);
+        setStartMousePos({ x: e.clientX, y: e.clientY });
+        const currentLeft = (panelStyle as React.CSSProperties).left as number;
+        const currentTop = (panelStyle as React.CSSProperties).top as number;
+        setDragOffset({ x: e.clientX - currentLeft, y: e.clientY - currentTop });
+      }}
     >
       <div className="flex justify-between items-start">
         <div className="flex-1 mr-4">
