@@ -24,6 +24,7 @@ from clustering import cluster_palette, fallback_pos
 from config import FILES_DIR, SPARK_APP_ID, SPARK_API_SECRET, SPARK_API_KEY, SPARK_WS_URL, SPARK_DOMAIN
 from text_processing import safe_stem
 
+import openai
 
 class AnalyzeBody(BaseModel):
     vectors: list[list[float]] | None = None
@@ -174,80 +175,66 @@ def create_app(store) -> FastAPI:
     def api_analyze(body: AnalyzeBody) -> dict[str, Any]:
         return store.analyze()
 
-    # --- 核心修改：使用 WebSocket 连接星火 X1.5 ---
+    # --- 核心修改：使用 Ollama AI 大模型 ---
     @app.post("/api/query")
     async def api_query(body: ChatBody) -> dict[str, Any]:
         question = body.question.strip()
         if not question:
-            return {"answer": "请输入有效的问题。", "cites": []}
+            return {"answer": "请输入您的问题。", "cites": []}
 
-        # 1. 生成鉴权 URL
-        auth_url = get_auth_url(SPARK_WS_URL, SPARK_API_KEY, SPARK_API_SECRET)
+        #  1. 检索阶段
+        # 调用在 store.py 里写的搜索方法
+        related_papers = store.search_similar_papers(question, top_k=3)
 
-        # 2. 构造请求参数 (符合 X1.5 文档)
-        data = {
-            "header": {
-                "app_id": SPARK_APP_ID,
-                "uid": "user_default"
-            },
-            "parameter": {
-                "chat": {
-                    "domain": SPARK_DOMAIN, # spark-x
-                    "temperature": 0.5,
-                    "max_tokens": 4096,
-                    "thinking": { "type": "enabled" } # 开启深度思考
-                }
-            },
-            "payload": {
-                "message": {
-                    "text": [
-                        {"role": "user", "content": question}
-                    ]
-                }
-            }
-        }
+        if not related_papers:
+            context = "未在本地库中找到相关论文。请根据你的知识尝试回答。"
+        else:
+            context_segments = []
+            for p in related_papers:
+                # 拼接标题和摘要作为 AI 的背景知识
+                segment = f"【论文标题】: {p['title']}\n【摘要内容】: {p['abstract']}"
+                context_segments.append(segment)
+            context = "\n\n".join(context_segments)
 
-        answer_content = ""
-        # reasoning_content = "" # 如果你想展示思考过程，可以收集这个变量
+        # 2. 本地生成阶段 (Ollama)
+        # Ollama 默认运行在 11434 端口
+        client = openai.OpenAI(
+            api_key="ollama",
+            base_url="http://localhost:11434/v1"
+        )
+
+        prompt = f"""你是一个专业的论文分析助手。请基于以下提供的参考资料，用简洁专业的语言回答用户的问题。
+    如果参考资料中没有相关信息，请直接说明。
+
+    参考资料：
+    {context}
+
+    用户问题：
+    {question}
+    """
 
         try:
-            async with websockets.connect(auth_url) as ws:
-                # 发送请求
-                await ws.send(json.dumps(data))
+            # 已经下载好的 qwen2.5:3b
+            response = client.chat.completions.create(
+                model="qwen2.5:3b",
+                messages=[
+                    {"role": "system", "content": "你是一个严谨的学术助手。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+            )
 
-                # 循环接收流式响应
-                async for message in ws:
-                    response = json.loads(message)
-                    header = response.get('header', {})
-                    code = header.get('code')
+            answer = response.choices[0].message.content
 
-                    if code != 0:
-                        err_msg = header.get('message') or "Unknown Error"
-                        print(f"Spark Error Code {code}: {err_msg}")
-                        return {"answer": f"AI Error: {err_msg} (Code {code})", "cites": []}
-
-                    payload = response.get('payload', {})
-                    choices = payload.get('choices', {})
-                    text_list = choices.get('text', [])
-
-                    for text in text_list:
-                        # 收集最终结果
-                        if 'content' in text:
-                            answer_content += text['content']
-                        # 收集思考过程 (暂不返回给前端，因为前端暂无展示位)
-                        # if 'reasoning_content' in text:
-                        #     reasoning_content += text['reasoning_content']
-
-                    status_code = header.get('status')
-                    if status_code == 2:
-                        # 会话结束
-                        break
-            
-            return {"answer": answer_content, "cites": []}
+            # 返回回答和引用的论文 ID，前端星系会高亮这些论文
+            return {
+                "answer": answer,
+                "cites": [p["id"] for p in related_papers]
+            }
 
         except Exception as e:
-            print(f"WebSocket Exception: {e}")
-            return {"answer": "连接 AI 服务超时或失败，请检查网络。", "cites": []}
+            print(f"Ollama Error: {e}")
+            return {"answer": f"本地 AI 响应失败，请确保 Ollama 已启动。错误: {str(e)}", "cites": []}
 
     @app.get("/files/{paper_id}.pdf")
     def api_files(paper_id: str) -> FileResponse:

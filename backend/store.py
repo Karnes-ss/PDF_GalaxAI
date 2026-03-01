@@ -337,3 +337,35 @@ class ScholarStore:
             fields_map[cid]["count"] += 1
             
         return {"nodes": nodes, "fields": list(fields_map.values())}
+    
+    #  新增：语义搜索功能
+    def search_similar_papers(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+        """根据用户问题，检索最相关的论文及其摘要"""
+        if not self._papers or self._vectors is None:
+            return []
+
+        with self._lock:
+            # 1. 确保模型已加载并向量化用户问题
+            model = self._ensure_model()
+            query_vector = model.encode([query], normalize_embeddings=True)
+
+            # 2. 计算余弦相似度
+            # self._vectors 形状是 (N, Dim), query_vector 形状是 (1, Dim)
+            sims = cosine_similarity(query_vector, self._vectors)[0]
+
+            # 3. 获取相似度最高的前 K 个索引
+            top_indices = np.argsort(sims)[::-1][:top_k]
+
+            results = []
+            for idx in top_indices:
+                score = float(sims[idx])
+                # 只有相关度大于 0.2 的才作为参考，避免强行回答
+                if score > 0.2:
+                    paper = self._papers[idx]
+                    results.append({
+                        "id": paper["id"],
+                        "title": paper["title"],
+                        "abstract": paper["abstract"],
+                        "score": score
+                    })
+            return results
