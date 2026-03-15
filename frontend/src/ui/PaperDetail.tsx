@@ -7,11 +7,12 @@ interface Props {
   edges: Edge[];
   onClose: () => void;
   onOpenReader: (p: Paper) => void;
+  onDelete: (p: Paper) => void;
   screenPosition: { x: number; y: number };
   aiChatWidth: number;
 }
 
-export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReader, screenPosition, aiChatWidth }: Props) {
+export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReader, onDelete, screenPosition, aiChatWidth }: Props) {
   const linked = edges.filter((e) => e.source === selectedPaper.id || e.target === selectedPaper.id);
   const linkCount = linked.length;
 
@@ -34,7 +35,7 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
       // Usable area excluding the AI chat
       const rightUsableEdge = windowWidth - aiChatWidthLocal;
 
-      const offsetFromSphere = 0;20; // Additional buffer to ensure it's not "touching"
+      const offsetFromSphere = 20; // Additional buffer to ensure it's not "touching"
       let finalLeft = screenPosition.x + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
       let finalTop = screenPosition.y + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
 
@@ -174,6 +175,15 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
         >
           <Search className="w-3 h-3" />
           深度阅读
+        </button>
+      </div>
+
+      <div className="pt-2 border-t border-white/10 flex justify-end">
+        <button
+          onClick={() => onDelete(selectedPaper)}
+          className="text-xs px-3 py-1.5 rounded-md border border-red-500/40 text-red-300 hover:bg-red-500/10 transition-colors"
+        >
+          删除该文献
         </button>
       </div>
     </div>

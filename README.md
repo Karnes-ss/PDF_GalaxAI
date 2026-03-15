@@ -1,130 +1,186 @@
 # PDF_GalaxAI
 
-一个本地运行的“论文星系”可视化 Demo：
-- 前端：Vite + React + Three.js（默认 http://localhost:3000）
-- 后端：FastAPI（默认 http://127.0.0.1:8000），负责 PDF 入库、抽取文本、生成向量与聚类、提供可视化数据接口
+本项目是一个本地运行的“论文星系”可视化 + RAG 问答系统：
 
-## 目录结构
+- 前端：Vite + React + Three.js（默认 `http://localhost:3000`）
+- 后端：FastAPI（默认 `http://127.0.0.1:8000`）
+- 向量库：Chroma（本地持久化）
+- 问答模型：支持 **本地 Ollama** 与 **云端 Gemini** 切换
 
-```text
-PDF_GalaxAI/
-├─ backend/                         # FastAPI 后端
-│  ├─ api.py                        # API 路由与 CORS
-│  ├─ main.py                       # uvicorn 入口：app
-│  ├─ store.py                      # PDF 入库/向量化/聚类/可视化数据
-│  ├─ config.py                     # 数据目录与环境变量
-│  ├─ text_processing.py            # PDF 文本抽取与关键词处理
-│  ├─ clustering.py                 # 降维/颜色/布局等
-│  ├─ server.py
-│  └─ requirements.txt
-├─ frontend/                        # React 源码
-│  └─ src/
-│     ├─ api/
-│     │  └─ client.ts
-│     ├─ rendering/
-│     │  └─ GalaxyRenderer.tsx
-│     ├─ types/
-│     │  └─ scholar.ts
-│     ├─ ui/
-│     │  └─ App.tsx
-│     └─ main.tsx
-├─ index.html
-├─ index.tsx                        # Vite 入口（转到 frontend/src/main）
-├─ index.css
-├─ package.json
-├─ tsconfig.json
-├─ vite.config.ts                   # dev 端口/代理（/api, /files -> 8000）
-├─ tailwind.config.cjs
-├─ postcss.config.cjs
-├─ package-lock.json
-├─ .gitignore
-└─ README.md
-```
+---
 
-## 环境要求
+## 1. 环境要求
 
-- Node.js：建议 18+（用于 Vite/React）
-- Python：建议 3.10+（用于 FastAPI 与数据处理）
+- Node.js 18+
+- Python 3.10+
+- （可选）Ollama（如果使用本地模型）
+- （可选）Gemini API Key（如果使用云端模型）
 
-首次运行后端时，`sentence-transformers` 可能会下载默认模型（取决于网络环境）。
+> 首次运行后端时，`sentence-transformers` 可能下载模型，耗时取决于网络。
 
-## 快速开始（Windows）
+---
 
-在项目根目录 `d:\PDF_GalaxAI` 打开两个终端分别启动后端与前端。
+## 2. 首次安装（Windows）
 
-### 1) 启动后端（FastAPI）
+在项目根目录（例如 `D:\destop\PDF_GalaxAI`）执行：
 
 ```powershell
-cd d:\PDF_GalaxAI
+cd D:\destop\PDF_GalaxAI
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -m pip install -U pip
 py -m pip install -r .\backend\requirements.txt
-
-# 启动后端（等价于：cd backend && py -m uvicorn main:app --reload --host 127.0.0.1 --port 8000）
-npm run backend
+npm install
 ```
-kkkk
-健康检查：
-- http://127.0.0.1:8000/api/health
 
-### 2) 启动前端（Vite）
+---
+
+## 3. 启动项目
+
+需要两个终端：
+
+### 终端 A：启动后端
 
 ```powershell
-cd d:\PDF_GalaxAI
-npm install
+cd D:\destop\PDF_GalaxAI
+.\.venv\Scripts\Activate.ps1
+npm run backend
+```
+
+健康检查：
+
+- `http://127.0.0.1:8000/api/health`
+
+### 终端 B：启动前端
+
+```powershell
+cd D:\destop\PDF_GalaxAI
 npm run dev
 ```
 
-打开页面：
-- http://localhost:3000
+打开：
 
-前端已配置代理：
-- `/api/*` 与 `/files/*` -> `http://127.0.0.1:8000`
+- `http://localhost:3000`
 
-## 快速开始（macOS）
+---
 
-### macOS（Homebrew）
+## 4. 本地模型与云端模型切换
 
-```bash
-# 首次安装依赖（已安装可跳过）
-brew --version >/dev/null 2>&1 || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install python node
+前端右上角有切换按钮：
 
-cd /path/to/PDF_GalaxAI
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r ./backend/requirements.txt
+- `本地 Ollama`
+- `云端 Gemini`
 
-cd backend
-python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+后端 `POST /api/query` 也支持传入 `provider`：
+
+```json
+{
+  "question": "MLP-2602 这篇文章讲了什么？",
+  "provider": "gemini"
+}
 ```
 
-另开终端启动前端：
+响应会包含 `provider_used`，用于确认实际走了哪个提供方。
 
-```bash
-cd /path/to/PDF_GalaxAI
-npm install
-npm run dev
+---
+
+## 5. Ollama（本地模型）准备
+
+### 安装并拉取模型
+
+```powershell
+ollama pull qwen2.5:3b
+ollama run qwen2.5:3b
 ```
 
-## 数据与导入 PDF
+如果 `ollama run` 能正常对话，说明本地模型可用。
 
-后端默认数据目录：
-- `backend/data/`
-  - `backend/data/inbox/`：放入待导入的 `.pdf`
-  - `backend/data/files/`：后端保存的 PDF（按 id 命名）
+可通过环境变量改默认模型名：
 
-导入方式：
-- 把 PDF 放到 `backend/data/inbox/` 后，启动后端会自动扫描一次
-- 或者在后端运行期间调用扫描接口：`POST /api/scan`
-- 或者通过上传接口：`POST /api/upload`（form-data，字段名 `file`）
+- `SCHOLAR_OLLAMA_MODEL=qwen2.5:3b`
 
-## 常用环境变量（可选）
+---
 
-在启动后端前设置：
-- `SCHOLAR_DATA_DIR`：自定义数据目录（默认 `backend/data`）
-- `SCHOLAR_INBOX_DIR`：自定义 inbox 目录（默认 `SCHOLAR_DATA_DIR/inbox`）
-- `SCHOLAR_ST_MODEL`：Sentence-Transformers 模型名（默认 `all-MiniLM-L6-v2`）
-- `SCHOLAR_OFFLINE=1`：强制离线加载模型（不会下载；需要本地已缓存模型）
+## 6. Gemini（云端模型）配置
+
+### 推荐方式：使用 `backend/.env`
+
+- 复制模板：
+
+```powershell
+copy .\backend\.env.example .\backend\.env
+```
+
+- 编辑 `backend/.env`，填入你的 key：
+
+```env
+SCHOLAR_LLM_PROVIDER=local
+SCHOLAR_OLLAMA_MODEL=qwen2.5:3b
+SCHOLAR_GEMINI_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=your_real_key
+```
+
+- 重启后端。
+
+### 可选方式：当前终端临时设置
+
+```powershell
+$env:GEMINI_API_KEY="your_real_key"
+$env:SCHOLAR_GEMINI_MODEL="gemini-2.5-flash"
+npm run backend
+```
+
+> 临时环境变量只对当前终端有效，开新终端后需要重新设置。
+
+### 检查 Gemini 是否生效
+
+- `GET /api/llm/status`
+- 关注字段：`gemini_key_configured: true`
+
+---
+
+## 7. 上传 / 删除文献
+
+### 上传
+
+- UI 上传按钮（推荐）
+- 或放入 `backend/data/inbox/` 后重启后端
+- 或调接口：`POST /api/upload` / `POST /api/papers/upload`
+
+### 删除
+
+- 在文献详情面板点击“删除该文献”
+- 或调接口：`DELETE /api/papers/{paper_id}`
+
+删除会同步清理：
+
+- 文献元数据
+- 对应 PDF 文件
+- 向量库中的该文献记录
+
+---
+
+## 8. 常见问题
+
+### Q1：前端提示未连接后端
+
+- 检查后端是否在 `127.0.0.1:8000` 正常运行。
+
+### Q2：云端 Gemini 提示未配置 `GEMINI_API_KEY`
+
+- 先看 `GET /api/llm/status` 的 `gemini_key_configured` 是否为 `true`。
+- 推荐改用 `backend/.env`，并重启后端。
+
+### Q3：本地模型 502
+
+- 确认 Ollama 在运行；
+- 确认模型已完整下载（不是只有几 KB manifest）；
+- `ollama run qwen2.5:3b` 能对话再回项目测试。
+
+---
+
+## 9. 安全建议
+
+- **不要把 API Key 写进代码并提交仓库**。
+- `backend/.env` 应加入 `.gitignore`（如未加入请手动添加）。
+- 若 key 曾暴露，请立即在平台控制台轮换。

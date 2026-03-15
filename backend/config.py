@@ -9,9 +9,12 @@ FILES_DIR = DATA_DIR / "files"
 PAPERS_JSON = DATA_DIR / "papers.json"
 INBOX_DIR = Path(os.getenv("SCHOLAR_INBOX_DIR") or (DATA_DIR / "inbox")).resolve()
 
+CHROMA_DIR = DATA_DIR / "chroma"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- 讯飞星火 WebSocket 配置 (X1.5 深度推理) ---
 # 鉴权信息 (来自你的图片)

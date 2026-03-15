@@ -158,7 +158,15 @@ export function GalaxyRenderer({
 
   // Keyboard event listeners for WASD
   useEffect(() => {
+    const isTypingTarget = (el: EventTarget | null) => {
+      const node = el as HTMLElement | null;
+      if (!node) return false;
+      const tag = (node.tagName || '').toLowerCase();
+      return tag === 'input' || tag === 'textarea' || node.isContentEditable;
+    };
+
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isTypingTarget(event.target)) return;
       switch (event.code) {
         case 'KeyW': moveState.current.backward = true; break;
         case 'KeyS': moveState.current.forward = true; break;
@@ -168,6 +176,7 @@ export function GalaxyRenderer({
     };
 
     const handleKeyUp = (event: KeyboardEvent) => {
+      if (isTypingTarget(event.target)) return;
       switch (event.code) {
         case 'KeyW': moveState.current.backward = false; break;
         case 'KeyS': moveState.current.forward = false; break;

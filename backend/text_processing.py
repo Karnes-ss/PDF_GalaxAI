@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -45,10 +46,16 @@ def read_pdf_text(pdf_path: Path, max_pages: int = 5) -> str:
 
 def clean_text(text: str) -> str:
     t = text or ""
+    # 统一 Unicode 兼容形式，修复部分 PDF 字形分裂问题（如全角/连字）
+    t = unicodedata.normalize("NFKC", t)
     t = t.replace("\x00", " ")
+    # 去掉不可见控制字符（保留换行）
+    t = re.sub(r"[\x01-\x08\x0B\x0C\x0E-\x1F]", " ", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub(r"[^\S\r\n]{2,}", " ", t)
+    # 压缩明显乱码噪声（保留单个 ? 以免破坏数学表达）
+    t = re.sub(r"\?{3,}", "??", t)
     return t.strip()
 
 

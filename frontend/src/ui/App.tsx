@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Activity, BookOpen, Compass, FileText, Search, Send, Sparkles, Upload, X, Zap } from 'lucide-react';
-import { fetchGraph, fileUrl, queryLocal, uploadPdf } from '../api/client';
+import { deletePaper, fetchGraph, fileUrl, queryWithProvider, uploadPdf } from '../api/client';
 import GalaxyArea from './GalaxyArea';
 import PaperDetail from './PaperDetail';
 import ReaderModal from './ReaderModal';
@@ -19,6 +19,8 @@ export function App() {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [llmProvider, setLlmProvider] = useState<'local' | 'gemini'>('local');
+  const [activeHighlights, setActiveHighlights] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const htmlPortalTargetRef = useRef<HTMLDivElement>(null);
@@ -27,17 +29,28 @@ export function App() {
     // Some logic if needed
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const g = await fetchGraph();
-        setPapers(g.papers);
-        setEdges(g.edges);
-      } catch {
-        setChat((prev) => [...prev, { role: 'ai', text: '⚠️ 未连接到本地后端：请确保 server.py 正在运行 (端口 8000)。' }]);
+  const refreshGraph = async (silent = false) => {
+    try {
+      const g = await fetchGraph();
+      setPapers(g.papers);
+      setEdges(g.edges);
+      if (!silent) {
+        setChat((prev) => [...prev, { role: 'ai', text: '🔄 已刷新星云数据。' }]);
       }
-    })();
+    } catch {
+      setChat((prev) => [...prev, { role: 'ai', text: '⚠️ 未连接到本地后端：请确保 server.py 正在运行 (端口 8000)。' }]);
+    }
+  };
+
+  useEffect(() => {
+    refreshGraph(true);
   }, []);
+
+  useEffect(() => {
+    if (activeHighlights.length === 0) return;
+    const t = window.setTimeout(() => setActiveHighlights([]), 12000);
+    return () => window.clearTimeout(t);
+  }, [activeHighlights]);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -46,9 +59,7 @@ export function App() {
     setLoading(true);
     try {
       await uploadPdf(f);
-      const g = await fetchGraph();
-      setPapers(g.papers);
-      setEdges(g.edges);
+      await refreshGraph(true);
       setChat((prev) => [...prev, { role: 'ai', text: `✅ 成功接入文献: ${fileName}。已完成空间映射与关键词连边。` }]);
     } catch {
       setChat((prev) => [...prev, { role: 'ai', text: '❌ 上传失败：请检查后端日志。' }]);
@@ -65,20 +76,23 @@ export function App() {
     
     // 立即显示用户消息
     setChat((prev) => [...prev, { role: 'user', text: msg }]);
+    setActiveHighlights([]);
     setLoading(true);
 
     try {
-      // 调用 client.ts 中的 queryLocal (它会请求后端 api.py)
-      const res = await queryLocal(msg);
+      const res = await queryWithProvider(msg, llmProvider);
       
       const answer = res.answer || 'AI 未返回内容';
       // 兼容两种引用格式：后端返回的 cites 数组 或 文本中的 [CITE:id] 标记
-      const cites =
-        res.cites ||
+      const cites = (
+        res.cites?.map((c) => (typeof c === 'string' ? c : c?.paper_id || '')) ||
         answer.match(/\[CITE:(\w+)\]/g)?.map((c) => c.replace('[CITE:', '').replace(']', '')) ||
-        [];
+        []
+      ).filter(Boolean);
         
-      setChat((prev) => [...prev, { role: 'ai', text: answer, cites }]);
+      const providerTag = res.provider_used === 'gemini' ? '（云端 Gemini）' : '（本地 Ollama）';
+      setChat((prev) => [...prev, { role: 'ai', text: `${answer}\n\n${providerTag}`, cites }]);
+      setActiveHighlights(cites);
     } catch (err) {
       console.error(err);
       setChat((prev) => [...prev, { role: 'ai', text: '❌ 检索失败：请检查后端连接或 API Key 配置。' }]);
@@ -110,10 +124,29 @@ export function App() {
 
   const handleSearchSelect = (p: Paper) => {
     setSelectedPaper(p);
+    setSelectedPaperScreenPosition({
+      x: Math.max(120, window.innerWidth * 0.42),
+      y: Math.max(90, window.innerHeight * 0.25),
+    });
     setHighlightedSearchPaperId(p.id);
     // clear search input to hide dropdown
     setSearchText('');
     // focusTarget is selectedPaper which will be passed into GalaxyArea
+  };
+
+  const handleDeleteSelectedPaper = async (paper: Paper) => {
+    const ok = window.confirm(`确认删除文献「${paper.displayTitle || paper.title}」吗？此操作不可撤销。`);
+    if (!ok) return;
+    try {
+      await deletePaper(paper.id);
+      setSelectedPaper(null);
+      setSelectedPaperScreenPosition(null);
+      setActiveHighlights((prev) => prev.filter((id) => id !== paper.id));
+      await refreshGraph(true);
+      setChat((prev) => [...prev, { role: 'ai', text: `🗑️ 已删除文献：${paper.displayTitle || paper.title}` }]);
+    } catch {
+      setChat((prev) => [...prev, { role: 'ai', text: '❌ 删除失败：请检查后端日志。' }]);
+    }
   };
 
   return (
@@ -132,8 +165,27 @@ export function App() {
             上传PDF
           </span>
         </button>
-        <Compass className="w-6 h-6 text-slate-500 hover:text-white cursor-pointer" />
-        <Activity className="w-6 h-6 text-slate-500 hover:text-white cursor-pointer" />
+        <button
+          onClick={() => {
+            setSelectedPaper(null);
+            setSelectedPaperScreenPosition(null);
+            setHighlightedSearchPaperId(null);
+            setActiveHighlights([]);
+            setSearchText('');
+            setChat((prev) => [...prev, { role: 'ai', text: '🧭 已回到全景视图（清空选中与高亮）。' }]);
+          }}
+          className="p-2 rounded-xl text-slate-500 hover:text-white hover:bg-white/10"
+          title="回到全景视图"
+        >
+          <Compass className="w-6 h-6" />
+        </button>
+        <button
+          onClick={() => refreshGraph(false)}
+          className="p-2 rounded-xl text-slate-500 hover:text-white hover:bg-white/10"
+          title="刷新星云数据"
+        >
+          <Activity className="w-6 h-6" />
+        </button>
         <input type="file" ref={fileInputRef} onChange={handleUpload} className="hidden" accept=".pdf" />
       </nav>
 
@@ -146,7 +198,7 @@ export function App() {
           setSelectedPaperScreenPosition(screenPos);
           setHighlightedSearchPaperId(null);
         }}
-        highlights={chat[chat.length - 1]?.cites || []}
+        highlights={activeHighlights}
         hideLabels={!!readerPaper}
         searchText={searchText}
         setSearchText={setSearchText}
@@ -167,7 +219,9 @@ export function App() {
             setSelectedPaperScreenPosition(null);
           }}
           onOpenReader={(p) => setReaderPaper(p)}
+          onDelete={handleDeleteSelectedPaper}
           screenPosition={selectedPaperScreenPosition}
+          aiChatWidth={420}
         />
       )}
 
@@ -182,8 +236,32 @@ export function App() {
           <h2 className="flex items-center gap-2 font-bold tracking-tight">
             <Sparkles className="w-4 h-4 text-yellow-400" /> 本地检索终端
           </h2>
-          <div className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full border border-green-500/30">
-            RAG ACTIVE
+          <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-md border border-white/20 bg-white/5 p-0.5">
+              <button
+                onClick={() => setLlmProvider('local')}
+                className={`text-[11px] px-2 py-1 rounded transition-all ${
+                  llmProvider === 'local'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                本地 Ollama
+              </button>
+              <button
+                onClick={() => setLlmProvider('gemini')}
+                className={`text-[11px] px-2 py-1 rounded transition-all ${
+                  llmProvider === 'gemini'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                云端 Gemini
+              </button>
+            </div>
+            <div className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full border border-green-500/30">
+              RAG ACTIVE
+            </div>
           </div>
         </div>
 
@@ -201,10 +279,23 @@ export function App() {
                     {m.cites.map((cid) => (
                       <button
                         key={cid}
-                        onClick={() => setSelectedPaper(papers.find((p) => p.id === cid) || null)}
+                        onClick={() => {
+                          const p = papers.find((x) => x.id === cid) || null;
+                          setSelectedPaper(p);
+                          setHighlightedSearchPaperId(null);
+                          setActiveHighlights([cid]);
+                          if (p) {
+                            setSelectedPaperScreenPosition({
+                              x: Math.max(120, window.innerWidth * 0.42),
+                              y: Math.max(90, window.innerHeight * 0.25),
+                            });
+                          } else {
+                            setSelectedPaperScreenPosition(null);
+                          }
+                        }}
                         className="text-[10px] bg-yellow-500/10 text-yellow-500 border border-yellow-500/30 px-2 py-0.5 rounded hover:bg-yellow-500/20 transition-all"
                       >
-                        证据文献 #{cid.slice(0, 4)}
+                        证据文献 #{cid.slice(0, 8)}
                       </button>
                     ))}
                   </div>

@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-# 设置 HF 镜像以解决国内连接问题
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
+import re
 import uuid
 from threading import Lock
 from typing import Any
 
+# 设置 HF 镜像以解决国内连接问题
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.metrics import calinski_harabasz_score, silhouette_score
+from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
@@ -19,8 +20,9 @@ try:
 except ImportError:
     SentenceTransformer = None
 
-from config import FILES_DIR, INBOX_DIR, PAPERS_JSON
+from chunker import chunk_text
 from clustering import cluster_palette, reduce_to_3d
+from config import FILES_DIR, INBOX_DIR, PAPERS_JSON
 from text_processing import (
     clean_text,
     extract_abstract_block,
@@ -30,117 +32,256 @@ from text_processing import (
     safe_stem,
     tfidf_keywords_block,
 )
+from vector_store import VectorStore
 
 
 class ScholarStore:
+    """
+    核心数据层。职责划分：
+      - PAPERS_JSON  : 论文元信息 + UI 状态（pos/cluster/color），重启不丢
+      - VectorStore  : 论文级向量（聚类用）+ Chunk 向量（RAG 检索用）
+      - 内存           : self._vectors 运行时缓存，供 api_papers 计算边权
+    """
+
     def __init__(self) -> None:
         self._lock = Lock()
         self._papers: list[dict[str, Any]] = []
-        self._vectors: np.ndarray | None = None
+        self._vectors: np.ndarray | None = None   # 运行时缓存，不持久化
         self._model = None
         self._model_name = os.getenv("SCHOLAR_ST_MODEL") or "all-MiniLM-L6-v2"
-        self._offline = (os.getenv("SCHOLAR_OFFLINE") or "").strip().lower() in {"1", "true", "yes"}
-        
-        # 初始化时尝试加载本地数据
+        self._offline = (
+            (os.getenv("SCHOLAR_OFFLINE") or "").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        self._vstore: VectorStore | None = None
+
         self._load_db()
 
-    def _ensure_model(self):
+    # ------------------------------------------------------------------ #
+    # 懒加载：模型 & 向量库
+    # ------------------------------------------------------------------ #
+
+    def _ensure_model(self) -> SentenceTransformer:
         if SentenceTransformer is None:
-            raise RuntimeError("sentence-transformers not installed")
+            raise RuntimeError("sentence-transformers 未安装")
         if self._model is not None:
             return self._model
-
         try:
             if self._offline:
-                self._model = SentenceTransformer(self._model_name, local_files_only=True)
+                self._model = SentenceTransformer(
+                    self._model_name, local_files_only=True
+                )
             else:
                 self._model = SentenceTransformer(self._model_name)
         except Exception as e:
             if not self._offline:
                 try:
-                    self._model = SentenceTransformer(self._model_name, local_files_only=True)
+                    self._model = SentenceTransformer(
+                        self._model_name, local_files_only=True
+                    )
                 except Exception:
                     pass
             if self._model is None:
                 raise RuntimeError(f"Failed to load embedding model: {e}") from e
         return self._model
 
+    def _ensure_vstore(self) -> VectorStore:
+        if self._vstore is None:
+            self._vstore = VectorStore()
+        return self._vstore
+
+    # ------------------------------------------------------------------ #
+    # 持久化：JSON 只存元信息 + UI 状态，不存向量
+    # ------------------------------------------------------------------ #
+
     def _load_db(self) -> None:
-        """从本地 JSON 加载数据，恢复 papers 和 vectors"""
+        """从 JSON 加载论文元信息与 UI 状态（不含向量）。"""
         if not PAPERS_JSON.exists():
             return
-        
         try:
             data = json.loads(PAPERS_JSON.read_text(encoding="utf-8"))
             with self._lock:
-                self._papers = data.get("papers", [])
-                vectors_list = data.get("vectors", [])
-                
-                # 如果保存了向量，恢复为 numpy array
-                if vectors_list and len(vectors_list) == len(self._papers):
-                    self._vectors = np.array(vectors_list, dtype=np.float32)
-                else:
-                    self._vectors = None
-            print(f"Loaded {len(self._papers)} papers from {PAPERS_JSON}")
+                papers = data.get("papers", [])
+                # 兼容旧格式：去掉可能残留的 vectors 字段（节省内存）
+                for p in papers:
+                    p.pop("vectors", None)
+                self._papers = papers
+            print(f"[store] Loaded {len(self._papers)} papers from JSON")
         except Exception as e:
-            print(f"Failed to load DB: {e}")
+            print(f"[store] Failed to load DB: {e}")
 
     def _save_db(self) -> None:
-        """将内存数据持久化到本地 JSON"""
+        """将论文元信息与 UI 状态持久化到 JSON（不含向量）。"""
         try:
-            vectors_list = []
-            if self._vectors is not None:
-                # Numpy array 无法直接序列化，需转为 list
-                vectors_list = self._vectors.tolist()
-            
-            data = {
-                "papers": self._papers,
-                "vectors": vectors_list
-            }
-            PAPERS_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 保存前确保不含向量字段
+            papers_clean = [
+                {k: v for k, v in p.items() if k != "vectors"}
+                for p in self._papers
+            ]
+            PAPERS_JSON.write_text(
+                json.dumps({"papers": papers_clean}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         except Exception as e:
-            print(f"Failed to save DB: {e}")
+            print(f"[store] Failed to save DB: {e}")
+
+    # ------------------------------------------------------------------ #
+    # 向量化辅助
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _paper_embed_text(paper: dict[str, Any]) -> str:
+        """生成论文级向量的文本（摘要 + 关键词）。"""
+        return (
+            f"{paper.get('abstract', '')}\n"
+            f"{' '.join(str(k) for k in (paper.get('keywords') or []))}"
+        ).strip()
+
+    @staticmethod
+    def _tokenize_query(text: str) -> list[str]:
+        """
+        将查询词拆为关键词 token（中英文混合）。
+        """
+        t = (text or "").lower()
+        toks = re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]{1,6}", t)
+        return list(dict.fromkeys(toks))
+
+    @staticmethod
+    def _text_quality_score(text: str) -> float:
+        """
+        估计文本质量（0~1），用于降低乱码 chunk 的排名。
+        经验规则：
+        - 出现 replacement char '�'、'??'、'a?��' 等异常模式会扣分
+        - 可读字符占比越高分越高
+        """
+        s = text or ""
+        if not s.strip():
+            return 0.0
+        total = max(1, len(s))
+
+        replacement_cnt = s.count("�")
+        qmark_cnt = s.count("?")
+        double_q_cnt = s.count("??")
+        mojibake_hint_cnt = len(re.findall(r"[a-zA-Z]\?��|\?��", s))
+        token_with_q_cnt = len(re.findall(r"\b\S*\?\S*\b", s))
+
+        # '?' 在正常学术文本中很少大量出现；出现密集通常是编码映射损坏
+        bad = (
+            replacement_cnt * 3
+            + double_q_cnt
+            + mojibake_hint_cnt * 2
+            + qmark_cnt * 0.8
+            + token_with_q_cnt * 0.6
+        )
+        bad_ratio = min(1.0, bad / total)
+
+        readable_chars = len(re.findall(r"[a-zA-Z0-9\u4e00-\u9fff\s,.;:!?()\-_/]", s))
+        readable_ratio = readable_chars / total
+
+        score = max(0.0, min(1.0, 0.65 * (1.0 - bad_ratio) + 0.35 * readable_ratio))
+        return score
+
+    def _index_paper(self, paper: dict[str, Any], full_text: str) -> None:
+        """
+        对单篇论文做向量化并写入 VectorStore（论文级 + Chunk 级）。
+        允许失败（仅打印警告），不影响主流程。
+        """
+        try:
+            model = self._ensure_model()
+            vstore = self._ensure_vstore()
+
+            # 论文级向量（用摘要+关键词）
+            paper_emb = model.encode(
+                [self._paper_embed_text(paper)], normalize_embeddings=True
+            )[0].astype(np.float32)
+            vstore.add_paper(paper["id"], paper_emb)
+
+            # Chunk 级向量（用全文）
+            chunks = chunk_text(paper["id"], full_text)
+            # 过滤明显乱码/过短 chunk，避免污染向量检索
+            chunks = [
+                c for c in chunks
+                if len(c.text.strip()) >= 40 and self._text_quality_score(c.text) >= 0.30
+            ]
+            if chunks:
+                chunk_embs = model.encode(
+                    [c.text for c in chunks], normalize_embeddings=True
+                ).astype(np.float32)
+                vstore.add_chunks(chunks, chunk_embs)
+                print(
+                    f"[store] Indexed {len(chunks)} chunks for '{paper.get('filename', paper['id'])}'"
+                )
+        except Exception as e:
+            print(f"[store] Warning: vector indexing failed for {paper.get('filename', '')}: {e}")
+
+    def ensure_all_indexed(self) -> None:
+        """
+        启动时调用：检查 JSON 中已有论文是否在 Chroma 里有向量；
+        若缺失则从对应 PDF 文件重新索引（兼容旧数据迁移）。
+        """
+        with self._lock:
+            papers = list(self._papers)
+
+        if not papers:
+            return
+
+        try:
+            vstore = self._ensure_vstore()
+        except Exception as e:
+            print(f"[store] VectorStore unavailable, skipping index check: {e}")
+            return
+
+        missing = [p for p in papers if not vstore.has_paper(p["id"])]
+        if not missing:
+            return
+
+        print(f"[store] Re-indexing {len(missing)} papers missing from Chroma ...")
+        for paper in missing:
+            pdf_path = FILES_DIR / f"{paper['id']}.pdf"
+            if not pdf_path.exists():
+                print(f"[store] PDF missing for {paper['id']}, skipping")
+                continue
+            try:
+                full_text = clean_text(read_pdf_text(pdf_path, max_pages=0))
+                self._index_paper(paper, full_text)
+            except Exception as e:
+                print(f"[store] Re-index failed for {paper['id']}: {e}")
+
+    # ------------------------------------------------------------------ #
+    # 添加 PDF
+    # ------------------------------------------------------------------ #
 
     def add_pdf(self, filename: str, raw: bytes, recompute: bool = True) -> str:
         paper_id = uuid.uuid4().hex[:10]
         pdf_path = FILES_DIR / f"{paper_id}.pdf"
         pdf_path.write_bytes(raw)
-        
-        # 提取文本
+
         try:
-            raw_text = read_pdf_text(pdf_path, max_pages=5)
-            cleaned = clean_text(raw_text)
+            full_text = read_pdf_text(pdf_path, max_pages=0)   # 全文
+            cleaned = clean_text(full_text)
         except Exception as e:
-            # 删除损坏文件
             if pdf_path.exists():
                 pdf_path.unlink()
-            raise ValueError(f"PDF parsing failed: {str(e)}")
+            raise ValueError(f"PDF 解析失败: {e}")
 
-        # 校验：如果提取内容为空或太短，视为无效文件
         if not cleaned or len(cleaned) < 50:
             if pdf_path.exists():
                 pdf_path.unlink()
-            raise ValueError("No text extracted from PDF (file might be image-only or encrypted).")
+            raise ValueError("PDF 无可提取文本（可能为纯图片或加密文件）")
 
         display_title = safe_stem(filename)
         title = extract_title_from_text(cleaned, display_title)
         abstract = extract_abstract_block(cleaned)
-        
-        # 提取第一句话
+
         first_sentence = ""
-        if cleaned:
-            import re
-            match = re.search(r'[^.!?。！？]+[.!?。！？]', cleaned)
-            if match:
-                first_sentence = match.group(0).strip()
-            else:
-                first_sentence = cleaned[:100].strip() + "..."
-        
+        m = re.search(r"[^.!?。！？]+[.!?。！？]", cleaned)
+        first_sentence = m.group(0).strip() if m else cleaned[:100].strip() + "..."
+
         keywords = extract_keywords_block(cleaned)
         if not keywords:
             keywords = tfidf_keywords_block(f"{title}\n{abstract}")
-            
-        paper = {
+
+        paper: dict[str, Any] = {
             "id": paper_id,
             "title": title,
             "display_title": display_title,
@@ -148,57 +289,208 @@ class ScholarStore:
             "first_sentence": first_sentence,
             "keywords": keywords,
             "filename": filename,
-            # 初始化默认字段，防止缺少键值
             "field": "Processing...",
             "confidence": 0.0,
             "cluster": 0,
             "pos": [0.0, 0.0, 0.0],
-            "size": 3.0
+            "size": 3.0,
         }
-        
+
+        # 向量化写入 Chroma
+        self._index_paper(paper, cleaned)
+
         with self._lock:
             self._papers.append(paper)
             if recompute:
                 self._recompute_locked()
             else:
-                # 如果不立即重算，也需要保存 papers 列表
                 self._save_db()
-                
+
         return paper_id
+
+    # ------------------------------------------------------------------ #
+    # Inbox 批量导入
+    # ------------------------------------------------------------------ #
 
     def ingest_from_inbox(self) -> int:
         if not INBOX_DIR.exists():
             return 0
 
-        count = 0
         with self._lock:
-            existing_filenames = {p.get("filename") for p in self._papers}
+            existing = {p.get("filename") for p in self._papers}
 
+        count = 0
         for pdf_path in INBOX_DIR.glob("*.pdf"):
-            if pdf_path.name in existing_filenames:
+            if pdf_path.name in existing:
                 continue
             try:
-                raw = pdf_path.read_bytes()
-                # 注意：这里会抛出 ValueError，需要捕获
-                self.add_pdf(pdf_path.name, raw, recompute=False)
+                self.add_pdf(pdf_path.name, pdf_path.read_bytes(), recompute=False)
                 count += 1
-                print(f"Ingested: {pdf_path.name}")
+                print(f"[store] Ingested: {pdf_path.name}")
             except Exception as e:
-                print(f"Error ingesting {pdf_path.name}: {e}")
+                print(f"[store] Error ingesting {pdf_path.name}: {e}")
 
         if count > 0:
             with self._lock:
                 self._recompute_locked()
+
         return count
 
+    # ------------------------------------------------------------------ #
+    # 聚类 + 可视化坐标重算
+    # ------------------------------------------------------------------ #
+
+    def _recompute_locked(self) -> None:
+        """
+        用 Chroma 中的论文级向量重新做聚类和 3D 降维，
+        结果写回 self._papers 并持久化到 JSON。
+        同时更新 self._vectors 运行时缓存（供 api_papers 计算边权）。
+        """
+        if not self._papers:
+            self._vectors = None
+            self._save_db()
+            return
+
+        vectors = self._get_paper_vectors_locked()
+        if vectors is None or len(vectors) != len(self._papers):
+            self._save_db()
+            return
+
+        self._vectors = vectors   # 更新运行时缓存
+        n = len(self._papers)
+
+        # --- KMeans 聚类 ---
+        if n == 1:
+            clusters = np.array([0])
+            centers = vectors.copy()
+        else:
+            best_km, best_labels, best_score = None, None, None
+            for k in range(2, min(8, n) + 1):
+                try:
+                    km = KMeans(n_clusters=k, n_init="auto", random_state=42)
+                    labels = km.fit_predict(vectors)
+                except Exception:
+                    continue
+                if np.unique(labels).size < 2:
+                    continue
+                try:
+                    s = float(silhouette_score(vectors, labels, metric="cosine"))
+                except Exception:
+                    continue
+                if best_score is None or s > best_score:
+                    best_score, best_km, best_labels = s, km, labels
+
+            if best_km is None:
+                k = min(5, max(2, int(round(np.sqrt(n)))), n)
+                best_km = KMeans(n_clusters=k, n_init="auto", random_state=42)
+                best_labels = best_km.fit_predict(vectors)
+
+            clusters = best_labels
+            centers = best_km.cluster_centers_
+
+        palette = cluster_palette()
+        for i, p in enumerate(self._papers):
+            cid = int(clusters[i])
+            p["cluster"] = cid
+            p["field"] = f"Topic {cid + 1}"
+            p["color"] = palette[cid % len(palette)]
+            sim = float(
+                cosine_similarity(
+                    vectors[i].reshape(1, -1), centers[cid].reshape(1, -1)
+                )[0, 0]
+            )
+            p["confidence"] = max(0.0, min(1.0, sim))
+
+        # --- 3D 降维 + 簇间分离 ---
+        coords = reduce_to_3d(vectors)
+        k_count = int(np.max(clusters)) + 1 if clusters.size else 1
+        if k_count > 1:
+            tightened = coords.astype(np.float32, copy=True)
+            for cid in range(k_count):
+                idx = np.where(clusters == cid)[0]
+                if idx.size == 0:
+                    continue
+                cm = tightened[idx].mean(axis=0, keepdims=True)
+                tightened[idx] = (tightened[idx] - cm) * 0.6
+                angle = float(2.0 * np.pi * cid / k_count)
+                offset = np.array(
+                    [np.cos(angle) * 5.0, 0.0, np.sin(angle) * 5.0],
+                    dtype=np.float32,
+                )
+                tightened[idx] += offset
+            coords = tightened
+
+        for i, p in enumerate(self._papers):
+            p["pos"] = [float(coords[i, 0]), float(coords[i, 1]), float(coords[i, 2])]
+            p["size"] = float(3.0 + p.get("confidence", 0.0) * 5.0)
+
+        self._save_db()
+
+    def _get_paper_vectors_locked(self) -> np.ndarray | None:
+        """
+        从 Chroma 获取所有论文的向量（顺序与 self._papers 一致）。
+        若某篇论文缺失，则重新编码并补写 Chroma。
+        返回 shape (n, dim) 的 numpy array；失败返回 None。
+        """
+        paper_ids = [p["id"] for p in self._papers]
+        try:
+            vstore = self._ensure_vstore()
+            model = self._ensure_model()
+        except Exception as e:
+            print(f"[store] Cannot get vectors: {e}")
+            return None
+
+        cached = vstore.get_paper_embeddings(paper_ids)
+
+        missing = [p for p in self._papers if p["id"] not in cached]
+        if missing:
+            texts = [self._paper_embed_text(p) for p in missing]
+            embs = model.encode(texts, normalize_embeddings=True)
+            for p, emb in zip(missing, embs):
+                arr = emb.astype(np.float32)
+                vstore.add_paper(p["id"], arr)
+                cached[p["id"]] = arr
+
+        rows = [cached.get(pid) for pid in paper_ids]
+        if any(r is None for r in rows):
+            return None
+        return np.stack(rows, axis=0)
+
+    # ------------------------------------------------------------------ #
+    # 列表 / 可视化
+    # ------------------------------------------------------------------ #
+
     def list_pdfs(self) -> list[dict[str, Any]]:
-        # 这里的 list_pdfs 主要是简单的列表返回，
-        # 详细逻辑现在主要由 API 层面的 api_papers 负责
-        out: list[dict[str, Any]] = []
         with self._lock:
-            for p in self._papers:
-                out.append(p)
-        return out
+            return list(self._papers)
+
+    def delete_paper(self, paper_id: str) -> bool:
+        """
+        删除指定论文（元数据 + PDF 文件 + 向量库记录），并重算可视化状态。
+        返回是否成功删除到论文记录。
+        """
+        with self._lock:
+            idx = next((i for i, p in enumerate(self._papers) if str(p.get("id") or "") == paper_id), -1)
+            if idx < 0:
+                return False
+            self._papers.pop(idx)
+
+            # 删除向量库记录（失败不阻断）
+            try:
+                self._ensure_vstore().delete_paper(paper_id)
+            except Exception as e:
+                print(f"[store] Warning: failed to delete vectors for {paper_id}: {e}")
+
+            # 删除 PDF 文件（失败不阻断）
+            try:
+                pdf_path = FILES_DIR / f"{paper_id}.pdf"
+                if pdf_path.exists():
+                    pdf_path.unlink()
+            except Exception as e:
+                print(f"[store] Warning: failed to delete pdf for {paper_id}: {e}")
+
+            self._recompute_locked()
+        return True
 
     def analyze(self) -> dict[str, Any]:
         with self._lock:
@@ -209,163 +501,91 @@ class ScholarStore:
         with self._lock:
             return self._visualization_locked()
 
-    def _recompute_locked(self) -> None:
-        if not self._papers:
-            self._vectors = None
-            self._save_db()
-            return
-            
-        model = self._ensure_model()
-        texts = [
-            f"{p.get('abstract','')}\n{' '.join([str(k) for k in (p.get('keywords') or [])])}".strip()
-            for p in self._papers
-        ]
-        
-        # 计算向量
-        vectors = model.encode(texts, normalize_embeddings=True)
-        self._vectors = np.array(vectors, dtype=np.float32)
-        n = len(self._papers)
-
-        # --- 聚类逻辑 (KMeans) ---
-        if n == 1:
-            clusters = np.array([0])
-            centers = self._vectors.copy()
-        else:
-            max_k = min(8, n)
-            candidate_ks = list(range(2, max_k + 1))
-            best_kmeans = None
-            best_clusters = None
-            best_key = None
-
-            for k in candidate_ks:
-                try:
-                    kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
-                    labels = kmeans.fit_predict(self._vectors)
-                except Exception:
-                    continue
-
-                uniq = np.unique(labels)
-                if uniq.size < 2 or uniq.size >= n:
-                    continue
-
-                sil = None
-                try:
-                    sil = float(silhouette_score(self._vectors, labels, metric="cosine"))
-                except Exception:
-                    pass
-
-                if sil is None:
-                    continue
-                
-                # 简化评分逻辑，主要看 Silhouette
-                key = sil
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_kmeans = kmeans
-                    best_clusters = labels
-
-            if best_kmeans is None or best_clusters is None:
-                # fallback
-                k = min(5, max(2, int(round(np.sqrt(n)))), n)
-                kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
-                clusters = kmeans.fit_predict(self._vectors)
-                centers = kmeans.cluster_centers_
-            else:
-                clusters = best_clusters
-                centers = best_kmeans.cluster_centers_
-
-        # --- 更新论文属性 ---
-        palette = cluster_palette()
-        for i, p in enumerate(self._papers):
-            cid = int(clusters[i])
-            p["cluster"] = cid
-            p["field"] = f"Topic {cid + 1}" # 简化命名
-            p["color"] = palette[cid % len(palette)]
-            
-            center = centers[cid] if centers is not None else self._vectors[i]
-            v = np.asarray(self._vectors[i], dtype=np.float32).reshape(1, -1)
-            c = np.asarray(center, dtype=np.float32).reshape(1, -1)
-            sim = float(cosine_similarity(v, c)[0, 0])
-            p["confidence"] = max(0.0, min(1.0, sim))
-
-        # --- 降维 (3D 坐标) ---
-        coords = reduce_to_3d(self._vectors)
-        
-        # 简单的径向分离 (使聚类在空间上更开)
-        k_count = int(np.max(clusters)) + 1 if clusters.size else 1
-        if k_count > 1 and coords.shape[0] == clusters.shape[0]:
-            tightened = coords.astype(np.float32, copy=True)
-            radius = 5.0
-            for cid in range(k_count):
-                idx = np.where(clusters == cid)[0]
-                if idx.size == 0:
-                    continue
-                # 将该簇向中心收缩
-                center_mass = tightened[idx].mean(axis=0, keepdims=True)
-                tightened[idx] = (tightened[idx] - center_mass) * 0.6
-                # 将该簇整体移向圆周
-                angle = float(2.0 * np.pi * (cid / k_count))
-                offset = np.array([np.cos(angle) * radius, 0.0, np.sin(angle) * radius], dtype=np.float32)
-                tightened[idx] = tightened[idx] + offset
-            coords = tightened
-
-        for i, p in enumerate(self._papers):
-            p["pos"] = [float(coords[i, 0]), float(coords[i, 1]), float(coords[i, 2])]
-            p["size"] = float(3.0 + (p.get("confidence", 0.0) * 5.0))
-
-        # 计算完成后保存到磁盘
-        self._save_db()
-
     def _visualization_locked(self) -> dict[str, Any]:
-        # 该方法可以复用 api.py 中的逻辑，或者保持现状
-        # 为了避免 api.py 和 store.py 逻辑重复，这里仅返回基础结构，主要由 api 组装
-        nodes = []
-        fields_map = {}
+        nodes, fields_map = [], {}
         for p in self._papers:
             cid = int(p.get("cluster", 0))
-            field_name = p.get("field", f"Topic {cid + 1}")
-            
-            nodes.append({
-                "id": p["id"],
-                "x": p["pos"][0],
-                "y": p["pos"][1],
-                "z": p["pos"][2],
-                "field": field_name,
-            })
+            field = p.get("field", f"Topic {cid + 1}")
+            nodes.append(
+                {
+                    "id": p["id"],
+                    "x": p["pos"][0],
+                    "y": p["pos"][1],
+                    "z": p["pos"][2],
+                    "field": field,
+                }
+            )
             if cid not in fields_map:
-                fields_map[cid] = {"name": field_name, "count": 0}
+                fields_map[cid] = {"name": field, "count": 0}
             fields_map[cid]["count"] += 1
-            
         return {"nodes": nodes, "fields": list(fields_map.values())}
-    
-    #  新增：语义搜索功能
-    def search_similar_papers(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
-        """根据用户问题，检索最相关的论文及其摘要"""
-        if not self._papers or self._vectors is None:
-            return []
 
-        with self._lock:
-            # 1. 确保模型已加载并向量化用户问题
+    # ------------------------------------------------------------------ #
+    # 语义检索（供 API 层调用）
+    # ------------------------------------------------------------------ #
+
+    def search_chunks(
+        self,
+        query: str,
+        top_k: int = 5,
+        paper_id: str | None = None,
+        min_score: float = 0.15,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """
+        对 query 做 Chunk 级语义检索。
+
+        返回 (results, status)
+        status 枚举：
+          "ok"          - 成功，results 非空
+          "no_match"    - 未找到相关度 >= min_score 的 chunk
+          "empty_db"    - 向量库无任何 chunk（尚未上传文档）
+          "model_error" - 模型或向量库初始化失败
+        """
+        try:
             model = self._ensure_model()
-            query_vector = model.encode([query], normalize_embeddings=True)
+            vstore = self._ensure_vstore()
+        except Exception as e:
+            print(f"[store] search_chunks model/vstore error: {e}")
+            return [], "model_error"
 
-            # 2. 计算余弦相似度
-            # self._vectors 形状是 (N, Dim), query_vector 形状是 (1, Dim)
-            sims = cosine_similarity(query_vector, self._vectors)[0]
+        if vstore.chunks_count() == 0:
+            return [], "empty_db"
 
-            # 3. 获取相似度最高的前 K 个索引
-            top_indices = np.argsort(sims)[::-1][:top_k]
+        q_emb = model.encode([query], normalize_embeddings=True)[0].astype(np.float32)
+        # 先多取一些候选，再做重排
+        candidate_k = max(top_k * 5, 20)
+        candidates = vstore.search_chunks(q_emb, top_k=candidate_k, paper_id=paper_id)
 
-            results = []
-            for idx in top_indices:
-                score = float(sims[idx])
-                # 只有相关度大于 0.2 的才作为参考，避免强行回答
-                if score > 0.2:
-                    paper = self._papers[idx]
-                    results.append({
-                        "id": paper["id"],
-                        "title": paper["title"],
-                        "abstract": paper["abstract"],
-                        "score": score
-                    })
-            return results
+        q_tokens = self._tokenize_query(query)
+        reranked: list[dict[str, Any]] = []
+        for r in candidates:
+            text = str(r.get("full_text") or r.get("snippet") or "")
+            text_l = text.lower()
+
+            lexical_hits = 0
+            for tok in q_tokens:
+                if tok in text_l:
+                    lexical_hits += 1
+            lexical_bonus = 0.0
+            if q_tokens:
+                lexical_bonus = lexical_hits / len(q_tokens)
+
+            quality = self._text_quality_score(text)
+            # 联合分：语义相似度 + 词面命中 + 文本质量
+            final_score = (
+                0.72 * float(r["score"]) +
+                0.18 * float(lexical_bonus) +
+                0.10 * float(quality)
+            )
+            rr = dict(r)
+            rr["raw_score"] = float(r["score"])
+            rr["quality"] = float(quality)
+            rr["score"] = float(final_score)
+            reranked.append(rr)
+
+        reranked.sort(key=lambda x: x["score"], reverse=True)
+        results = [r for r in reranked if r["score"] >= min_score][:top_k]
+
+        if not results:
+            return [], "no_match"
+        return results, "ok"

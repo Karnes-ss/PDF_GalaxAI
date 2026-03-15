@@ -24,12 +24,26 @@ export async function uploadPdf(file: File): Promise<void> {
   if (!r.ok) throw new Error(`POST /api/papers/upload failed: ${r.status}`);
 }
 
+export async function deletePaper(paperId: string): Promise<void> {
+  const r = await fetch(apiUrl(`/api/papers/${paperId}`), { method: 'DELETE' });
+  if (!r.ok) throw new Error(`DELETE /api/papers/${paperId} failed: ${r.status}`);
+}
+
 export async function queryLocal(prompt: string): Promise<QueryResponse> {
   const r = await fetch(apiUrl('/api/query'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    // ⚠️ CRITICAL CHANGE: 后端 api.py 中的 ChatBody 定义字段为 'question'，必须匹配
-    body: JSON.stringify({ question: prompt }),
+    body: JSON.stringify({ question: prompt, provider: 'local' }),
+  });
+  if (!r.ok) throw new Error(`POST /api/query failed: ${r.status}`);
+  return r.json();
+}
+
+export async function queryWithProvider(prompt: string, provider: 'local' | 'gemini'): Promise<QueryResponse> {
+  const r = await fetch(apiUrl('/api/query'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: prompt, provider }),
   });
   if (!r.ok) throw new Error(`POST /api/query failed: ${r.status}`);
   return r.json();

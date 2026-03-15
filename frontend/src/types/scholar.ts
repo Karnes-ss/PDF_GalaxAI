@@ -29,5 +29,7 @@ export type GraphResponse = {
 
 export type QueryResponse = {
   answer: string;
-  cites: string[];
+  cites: Array<string | { paper_id?: string; chunk_id?: string; snippet?: string }>;
+  cite_details?: Array<{ paper_id: string; chunk_id?: string; snippet?: string }>;
+  provider_used?: 'local' | 'gemini';
 };
