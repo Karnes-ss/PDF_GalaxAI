@@ -42,12 +42,23 @@ def reduce_to_3d(vectors: np.ndarray) -> np.ndarray:
     if n == 1:
         return np.zeros((1, 3), dtype=np.float32)
 
+    if n == 2:
+        return np.array(
+            [[-2.5, 0.0, 0.0], [2.5, 0.0, 0.0]], dtype=np.float32
+        )
+
+    if n == 3:
+        return np.array(
+            [[0.0, 2.5, 0.0], [-2.5, -1.25, 0.0], [2.5, -1.25, 0.0]],
+            dtype=np.float32,
+        )
+
     coords: np.ndarray | None = None
-    if umap is not None and n >= 5:
+    if umap is not None:
         try:
             reducer = umap.UMAP(
                 n_components=3,
-                n_neighbors=min(10, n - 1),
+                n_neighbors=min(10, max(2, n - 1)),
                 min_dist=0.12,
                 init="random" if n < 10 else "spectral",
                 random_state=42,
@@ -57,11 +68,16 @@ def reduce_to_3d(vectors: np.ndarray) -> np.ndarray:
             coords = None
 
     if coords is None:
-        pca = PCA(n_components=3, random_state=42)
+        n_components = min(3, n, vectors.shape[1])
+        pca = PCA(n_components=n_components, random_state=42)
         coords = pca.fit_transform(vectors)
+        if coords.shape[1] < 3:
+            coords = np.pad(coords, ((0, 0), (0, 3 - coords.shape[1])), constant_values=0.0)
 
     coords = coords - coords.mean(axis=0, keepdims=True)
     max_abs = float(np.max(np.abs(coords))) if coords.size else 1.0
     if max_abs < 1e-6:
         max_abs = 1.0
-    return (coords / max_abs * 5.5).astype(np.float32)
+    coords = (coords / max_abs * 5.5).astype(np.float32)
+
+    return coords

@@ -17,16 +17,41 @@ export async function fetchGraph(): Promise<GraphResponse> {
   return r.json();
 }
 
+async function parseErrorResponse(response: Response, defaultMessage: string): Promise<Error> {
+  const contentType = response.headers.get('Content-Type') || '';
+  let detail = defaultMessage;
+
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await response.json();
+      if (body?.detail) {
+        detail = String(body.detail);
+      } else if (body?.message) {
+        detail = String(body.message);
+      }
+    } else {
+      const text = await response.text();
+      if (text) {
+        detail = text;
+      }
+    }
+  } catch {
+    // ignore parse errors, fall back to default message
+  }
+
+  return new Error(detail || defaultMessage);
+}
+
 export async function uploadPdf(file: File): Promise<void> {
   const fd = new FormData();
   fd.append('file', file);
   const r = await fetch(apiUrl('/api/papers/upload'), { method: 'POST', body: fd });
-  if (!r.ok) throw new Error(`POST /api/papers/upload failed: ${r.status}`);
+  if (!r.ok) throw await parseErrorResponse(r, `POST /api/papers/upload failed: ${r.status}`);
 }
 
 export async function deletePaper(paperId: string): Promise<void> {
   const r = await fetch(apiUrl(`/api/papers/${paperId}`), { method: 'DELETE' });
-  if (!r.ok) throw new Error(`DELETE /api/papers/${paperId} failed: ${r.status}`);
+  if (!r.ok) throw await parseErrorResponse(r, `DELETE /api/papers/${paperId} failed: ${r.status}`);
 }
 
 export async function queryLocal(prompt: string): Promise<QueryResponse> {

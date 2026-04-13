@@ -24,41 +24,50 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
   useEffect(() => {
     const calculatePosition = () => {
       const panelWidth = 420;
-      const panelHeight = 300; // Approximate, adjust if needed
-      const aiChatWidthLocal = aiChatWidth; // Use the prop
-      const sphereRadiusPx = 80; // Visual buffer from the sphere center
-      const padding = 10; // Minimum padding from window edges
+      // More accurate height calculation based on component structure
+      const panelHeight = 400; // Increased from 300 to account for actual content
+      const aiChatWidthLocal = aiChatWidth;
+      const padding = 10;
 
       const windowWidth = window.innerWidth;
       const windowHeight = window.innerHeight;
 
-      // Usable area excluding the AI chat
       const rightUsableEdge = windowWidth - aiChatWidthLocal;
+      const leftUsableEdge = 80; // Left sidebar width
 
-      const offsetFromSphere = 20; // Additional buffer to ensure it's not "touching"
-      let finalLeft = screenPosition.x + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
-      let finalTop = screenPosition.y + sphereRadiusPx + offsetFromSphere; // Always prefer bottom-right
+      // Define possible positions with preference order
+      const possiblePositions = [
+        // Bottom-right (preferred when click point is in top-left area)
+        { x: screenPosition.x + 20, y: screenPosition.y + 20, priority: 1 },
+        // Bottom-left (preferred when click point is in top-right area)
+        { x: screenPosition.x - panelWidth - 20, y: screenPosition.y + 20, priority: 2 },
+        // Top-right (fallback when bottom is blocked)
+        { x: screenPosition.x + 20, y: screenPosition.y - panelHeight - 20, priority: 3 },
+        // Top-left (last resort)
+        { x: screenPosition.x - panelWidth - 20, y: screenPosition.y - panelHeight - 20, priority: 4 },
+      ];
 
-      // --- Boundary adjustments --- 
+      // Filter positions that fit within bounds
+      const validPositions = possiblePositions.filter(pos => {
+        const clampedLeft = Math.max(leftUsableEdge + padding, Math.min(pos.x, rightUsableEdge - panelWidth - padding));
+        const clampedTop = Math.max(padding, Math.min(pos.y, windowHeight - panelHeight - padding));
+        return clampedLeft === pos.x && clampedTop === pos.y; // Only if no clamping was needed
+      });
 
-      // Adjust for left edge
-      if (finalLeft < padding) {
-        finalLeft = padding;
-      }
+      let finalLeft: number;
+      let finalTop: number;
 
-      // Adjust for top edge
-      if (finalTop < padding) {
-        finalTop = padding;
-      }
-
-      // Adjust for right edge (considering AI chat area)
-      if (finalLeft + panelWidth > rightUsableEdge - padding) {
-        finalLeft = rightUsableEdge - panelWidth - padding;
-      }
-      
-      // Adjust for bottom edge
-      if (finalTop + panelHeight > windowHeight - padding) {
-        finalTop = windowHeight - panelHeight - padding;
+      if (validPositions.length > 0) {
+        // Use the highest priority valid position
+        const bestPos = validPositions.reduce((best, current) =>
+          current.priority < best.priority ? current : best
+        );
+        finalLeft = bestPos.x;
+        finalTop = bestPos.y;
+      } else {
+        // Fallback: clamp the preferred position
+        finalLeft = Math.max(leftUsableEdge + padding, Math.min(possiblePositions[0].x, rightUsableEdge - panelWidth - padding));
+        finalTop = Math.max(padding, Math.min(possiblePositions[0].y, windowHeight - panelHeight - padding));
       }
 
       setPanelStyle({
@@ -68,9 +77,9 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
       });
     };
 
-    calculatePosition(); // Initial calculation
-    window.addEventListener('resize', calculatePosition); // Recalculate on resize
-    return () => window.removeEventListener('resize', calculatePosition); // Cleanup
+    calculatePosition();
+    window.addEventListener('resize', calculatePosition);
+    return () => window.removeEventListener('resize', calculatePosition);
   }, [screenPosition, selectedPaper.color]);
 
   useEffect(() => {
@@ -126,7 +135,7 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
       }}
     >
       <div className="flex justify-between items-start">
-        <div className="flex-1 mr-4">
+        <div className="flex-1 mr-4 min-w-0">
           <div className="flex items-center gap-2 mb-1">
             <span
               className="text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider text-black/80"
@@ -136,7 +145,7 @@ export default function PaperDetail({ selectedPaper, edges, onClose, onOpenReade
             </span>
             <span className="text-[10px] text-slate-500 font-mono">CONF: {(selectedPaper.confidence * 100).toFixed(0)}%</span>
           </div>
-          <h3 className="font-bold text-lg leading-tight text-white/90" title={selectedPaper.title}>
+          <h3 className="font-bold text-lg leading-tight text-white/90 break-words break-all" title={selectedPaper.title}>
             {selectedPaper.displayTitle}
           </h3>
         </div>

@@ -51,6 +51,14 @@ def clean_text(text: str) -> str:
     t = t.replace("\x00", " ")
     # 去掉不可见控制字符（保留换行）
     t = re.sub(r"[\x01-\x08\x0B\x0C\x0E-\x1F]", " ", t)
+    # 处理 PDF 换行导致的英文单词粘连
+    t = re.sub(r"-\n([A-Za-z])", r"\1", t)
+    t = re.sub(r"(?<=[A-Za-z])\n(?=[A-Za-z])", " ", t)
+    # 处理下划线连接词，以及连写的英文单词
+    t = re.sub(r"_+", " ", t)
+    t = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
+    t = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", t)
+    t = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub(r"[^\S\r\n]{2,}", " ", t)

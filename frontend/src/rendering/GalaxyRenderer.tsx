@@ -59,7 +59,7 @@ function PaperNode({
   isSelected: boolean;
   htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
 }) {
-  const { camera, size } = useThree();
+  const { camera, size, gl } = useThree();
   const [hovered, setHover] = useState(false);
   const position = useMemo(() => new THREE.Vector3(...paper.pos), [paper.pos]);
 
@@ -73,11 +73,12 @@ function PaperNode({
       <mesh 
         onClick={(e) => {
           e.stopPropagation();
-          // Calculate screen position
+          // Calculate screen position based on actual canvas position within the window
           const vector = position.clone().project(camera);
-          const x = (vector.x * 0.5 + 0.5) * size.width;
-          const y = (-vector.y * 0.5 + 0.5) * size.height;
-          onSelect(paper, { x, y }); // Pass screen position
+          const canvasBounds = gl.domElement.getBoundingClientRect();
+          const x = canvasBounds.left + (vector.x * 0.5 + 0.5) * canvasBounds.width;
+          const y = canvasBounds.top + (-vector.y * 0.5 + 0.5) * canvasBounds.height;
+          onSelect(paper, { x, y }); // Pass window-relative screen position
         }}
         onPointerOver={() => setHover(true)}
         onPointerOut={() => setHover(false)}

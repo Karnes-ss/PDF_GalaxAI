@@ -37,7 +37,8 @@ export function App() {
       if (!silent) {
         setChat((prev) => [...prev, { role: 'ai', text: '🔄 已刷新星云数据。' }]);
       }
-    } catch {
+    } catch (error) {
+      console.error('Failed to refresh graph:', error);
       setChat((prev) => [...prev, { role: 'ai', text: '⚠️ 未连接到本地后端：请确保 server.py 正在运行 (端口 8000)。' }]);
     }
   };
@@ -56,13 +57,53 @@ export function App() {
     const f = e.target.files?.[0];
     if (!f) return;
     const fileName = f.name;
+
     setLoading(true);
     try {
+      // Clear states before upload
+      setSelectedPaper(null);
+      setSelectedPaperScreenPosition(null);
+      setActiveHighlights([]);
+      setHighlightedSearchPaperId(null);
+      setSearchText('');
+
+      console.log(`[upload] Starting upload of ${fileName}`);
       await uploadPdf(f);
-      await refreshGraph(true);
+      console.log(`[upload] File uploaded successfully`);
+
+      // Wait longer for backend processing and clustering
+      console.log(`[upload] Waiting 2.5 seconds for backend processing...`);
+      await new Promise(resolve => setTimeout(resolve, 2500));
+
+      // Refresh from server with retries
+      console.log(`[upload] Refreshing graph`);
+      let g = null;
+      let lastError = null;
+      for (let retries = 3; retries > 0; retries--) {
+        try {
+          g = await fetchGraph();
+          break;
+        } catch (err) {
+          lastError = err;
+          if (retries > 1) {
+            console.log(`[upload] Graph refresh failed, retrying... (${retries - 1} left)`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      }
+      
+      if (!g) {
+        throw lastError || new Error('Failed to refresh graph');
+      }
+      
+      console.log(`[upload] Graph refreshed, papers count: ${g.papers.length}`);
+      setPapers(g.papers);
+      setEdges(g.edges);
+      
       setChat((prev) => [...prev, { role: 'ai', text: `✅ 成功接入文献: ${fileName}。已完成空间映射与关键词连边。` }]);
-    } catch {
-      setChat((prev) => [...prev, { role: 'ai', text: '❌ 上传失败：请检查后端日志。' }]);
+    } catch (error) {
+      console.error('Upload failed:', error);
+      setChat((prev) => [...prev, { role: 'ai', text: `❌ 上传失败: ${error instanceof Error ? error.message : '未知错误'}` }]);
     } finally {
       setLoading(false);
       e.target.value = '';
@@ -137,15 +178,62 @@ export function App() {
   const handleDeleteSelectedPaper = async (paper: Paper) => {
     const ok = window.confirm(`确认删除文献「${paper.displayTitle || paper.title}」吗？此操作不可撤销。`);
     if (!ok) return;
+
+    const originalPapers = [...papers];
+    const originalEdges = [...edges];
+
     try {
-      await deletePaper(paper.id);
+      // Optimistically update UI first
       setSelectedPaper(null);
       setSelectedPaperScreenPosition(null);
       setActiveHighlights((prev) => prev.filter((id) => id !== paper.id));
-      await refreshGraph(true);
+      setHighlightedSearchPaperId(null);
+      setSearchText('');
+
+      // Remove from local state immediately
+      setPapers(prev => prev.filter(p => p.id !== paper.id));
+      setEdges(prev => prev.filter(e => e.source !== paper.id && e.target !== paper.id));
+
+      console.log(`[delete] Starting delete of ${paper.id}`);
+      await deletePaper(paper.id);
+      console.log(`[delete] Delete request completed`);
+
+      // Wait for backend processing
+      console.log(`[delete] Waiting 1 second for backend processing...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Refresh from server with retries
+      console.log(`[delete] Refreshing graph`);
+      let g = null;
+      let lastError = null;
+      for (let retries = 3; retries > 0; retries--) {
+        try {
+          g = await fetchGraph();
+          break;
+        } catch (err) {
+          lastError = err;
+          if (retries > 1) {
+            console.log(`[delete] Graph refresh failed, retrying... (${retries - 1} left)`);
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+      }
+      
+      if (!g) {
+        throw lastError || new Error('Failed to refresh graph');
+      }
+      
+      console.log(`[delete] Graph refreshed, papers count: ${g.papers.length}`);
+      setPapers(g.papers);
+      setEdges(g.edges);
+      
       setChat((prev) => [...prev, { role: 'ai', text: `🗑️ 已删除文献：${paper.displayTitle || paper.title}` }]);
-    } catch {
-      setChat((prev) => [...prev, { role: 'ai', text: '❌ 删除失败：请检查后端日志。' }]);
+    } catch (error) {
+      console.error('Delete failed:', error);
+      // Revert optimistic updates on failure
+      setPapers(originalPapers);
+      setEdges(originalEdges);
+      setChat((prev) => [...prev, { role: 'ai', text: `❌ 删除失败: ${error instanceof Error ? error.message : '未知错误'}` }]);
     }
   };
 
@@ -269,7 +357,7 @@ export function App() {
           {chat.map((m, i) => (
             <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div
-                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap break-words break-all ${
                   m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-white/5 border border-white/10'
                 }`}
               >

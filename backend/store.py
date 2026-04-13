@@ -254,7 +254,10 @@ class ScholarStore:
     def add_pdf(self, filename: str, raw: bytes, recompute: bool = True) -> str:
         paper_id = uuid.uuid4().hex[:10]
         pdf_path = FILES_DIR / f"{paper_id}.pdf"
-        pdf_path.write_bytes(raw)
+        try:
+            pdf_path.write_bytes(raw)
+        except Exception as e:
+            raise ValueError(f"PDF 文件保存失败: {e}")
 
         try:
             full_text = read_pdf_text(pdf_path, max_pages=0)   # 全文
@@ -267,19 +270,31 @@ class ScholarStore:
         if not cleaned or len(cleaned) < 50:
             if pdf_path.exists():
                 pdf_path.unlink()
-            raise ValueError("PDF 无可提取文本（可能为纯图片或加密文件）")
+            raise ValueError(f"PDF 无可提取文本（长度: {len(cleaned) if cleaned else 0}）")
 
         display_title = safe_stem(filename)
-        title = extract_title_from_text(cleaned, display_title)
-        abstract = extract_abstract_block(cleaned)
+        try:
+            title = extract_title_from_text(cleaned, display_title)
+            abstract = extract_abstract_block(cleaned)
+        except Exception as e:
+            if pdf_path.exists():
+                pdf_path.unlink()
+            raise ValueError(f"元数据提取失败: {e}")
 
         first_sentence = ""
-        m = re.search(r"[^.!?。！？]+[.!?。！？]", cleaned)
-        first_sentence = m.group(0).strip() if m else cleaned[:100].strip() + "..."
+        try:
+            m = re.search(r"[^.!?。！？]+[.!?。！？]", cleaned)
+            first_sentence = m.group(0).strip() if m else cleaned[:100].strip() + "..."
+        except Exception:
+            first_sentence = cleaned[:100].strip() + "..."
 
-        keywords = extract_keywords_block(cleaned)
-        if not keywords:
-            keywords = tfidf_keywords_block(f"{title}\n{abstract}")
+        try:
+            keywords = extract_keywords_block(cleaned)
+            if not keywords:
+                keywords = tfidf_keywords_block(f"{title}\n{abstract}")
+        except Exception as e:
+            print(f"[store] Warning: keyword extraction failed: {e}")
+            keywords = [title[:20]] if title else []
 
         paper: dict[str, Any] = {
             "id": paper_id,
@@ -297,14 +312,23 @@ class ScholarStore:
         }
 
         # 向量化写入 Chroma
-        self._index_paper(paper, cleaned)
+        try:
+            self._index_paper(paper, cleaned)
+        except Exception as e:
+            print(f"[store] Warning: indexing failed: {e}")
 
         with self._lock:
             self._papers.append(paper)
-            if recompute:
-                self._recompute_locked()
-            else:
-                self._save_db()
+            try:
+                if recompute:
+                    self._recompute_locked()
+                else:
+                    self._save_db()
+            except Exception as e:
+                self._papers.pop()
+                if pdf_path.exists():
+                    pdf_path.unlink()
+                raise ValueError(f"图表计算失败: {e}")
 
         return paper_id
 
@@ -404,7 +428,18 @@ class ScholarStore:
         # --- 3D 降维 + 簇间分离 ---
         coords = reduce_to_3d(vectors)
         k_count = int(np.max(clusters)) + 1 if clusters.size else 1
-        if k_count > 1:
+
+        # For small numbers of papers, ensure good separation
+        if n <= 3:
+            # Use fixed positions for better separation
+            if n == 2:
+                coords[0] = np.array([-3.0, 0.0, 0.0], dtype=np.float32)
+                coords[1] = np.array([3.0, 0.0, 0.0], dtype=np.float32)
+            elif n == 3:
+                coords[0] = np.array([0.0, 3.0, 0.0], dtype=np.float32)
+                coords[1] = np.array([-3.0, -1.5, 0.0], dtype=np.float32)
+                coords[2] = np.array([3.0, -1.5, 0.0], dtype=np.float32)
+        elif k_count > 1:
             tightened = coords.astype(np.float32, copy=True)
             for cid in range(k_count):
                 idx = np.where(clusters == cid)[0]
@@ -489,7 +524,11 @@ class ScholarStore:
             except Exception as e:
                 print(f"[store] Warning: failed to delete pdf for {paper_id}: {e}")
 
-            self._recompute_locked()
+            try:
+                self._recompute_locked()
+            except Exception as e:
+                print(f"[store] Warning: failed to recompute after delete: {e}")
+                self._save_db()
         return True
 
     def analyze(self) -> dict[str, Any]:

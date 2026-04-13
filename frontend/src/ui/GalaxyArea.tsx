@@ -43,7 +43,7 @@ export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLa
                   className="w-full text-left px-2 py-2 hover:bg-white/5 rounded text-sm"
                 >
                   <div className="font-semibold truncate">{r.displayTitle || r.title}</div>
-                  <div className="text-[11px] text-slate-400 truncate">{r.filename}</div>
+                  <div className="text-[11px] text-slate-400 break-words break-all max-w-full">{r.filename}</div>
                 </button>
               ))}
             </div>

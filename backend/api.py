@@ -305,16 +305,22 @@ def create_app(store) -> FastAPI:
         if not raw:
             raise HTTPException(status_code=400, detail="文件为空")
         try:
+            print(f"[api] Starting upload: {file.filename} ({len(raw)} bytes)")
             pdf_id = store.add_pdf(file.filename, raw)
+            print(f"[api] Upload successful: {file.filename} -> {pdf_id}")
         except ValueError as e:
+            print(f"[api] Validation error during upload: {e}")
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
             )
         except RuntimeError as e:
+            print(f"[api] Runtime error during upload: {e}")
             raise HTTPException(status_code=503, detail=str(e))
         except Exception as e:
-            print(f"[api] Upload failed: {e}")
-            raise HTTPException(status_code=500, detail="内部错误")
+            print(f"[api] Unexpected error during upload: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
         return {"success": True, "pdf_id": pdf_id}
 
     @app.post("/api/papers/upload")
@@ -323,10 +329,21 @@ def create_app(store) -> FastAPI:
 
     @app.delete("/api/papers/{paper_id}")
     def api_delete_paper(paper_id: str) -> dict[str, Any]:
-        ok = store.delete_paper(paper_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="paper not found")
-        return {"success": True, "paper_id": paper_id}
+        try:
+            print(f"[api] Starting delete: {paper_id}")
+            ok = store.delete_paper(paper_id)
+            if not ok:
+                print(f"[api] Delete failed: paper {paper_id} not found")
+                raise HTTPException(status_code=404, detail="paper not found")
+            print(f"[api] Delete successful: {paper_id}")
+            return {"success": True, "paper_id": paper_id}
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[api] Unexpected error during delete: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/api/analyze")
     def api_analyze(body: AnalyzeBody) -> dict[str, Any]:
