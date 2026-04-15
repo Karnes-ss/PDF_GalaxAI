@@ -364,28 +364,38 @@ export function App() {
                 {m.text}
                 {m.cites && m.cites.length > 0 && (
                   <div className="mt-4 pt-3 border-t border-white/10 flex flex-wrap gap-2">
-                    {m.cites.map((cid) => (
-                      <button
-                        key={cid}
-                        onClick={() => {
-                          const p = papers.find((x) => x.id === cid) || null;
-                          setSelectedPaper(p);
-                          setHighlightedSearchPaperId(null);
-                          setActiveHighlights([cid]);
-                          if (p) {
-                            setSelectedPaperScreenPosition({
-                              x: Math.max(120, window.innerWidth * 0.42),
-                              y: Math.max(90, window.innerHeight * 0.25),
-                            });
-                          } else {
-                            setSelectedPaperScreenPosition(null);
-                          }
-                        }}
-                        className="text-[10px] bg-yellow-500/10 text-yellow-500 border border-yellow-500/30 px-2 py-0.5 rounded hover:bg-yellow-500/20 transition-all"
-                      >
-                        证据文献 #{cid.slice(0, 8)}
-                      </button>
-                    ))}
+                    {m.cites.map((cid) => {
+                      const citedPaper = papers.find((x) => x.id === cid) || null;
+                      const citeColor = citedPaper?.color || '#22d3ee';
+
+                      return (
+                        <button
+                          key={cid}
+                          onClick={() => {
+                            setSelectedPaper(citedPaper);
+                            setHighlightedSearchPaperId(null);
+                            setActiveHighlights([cid]);
+                            if (citedPaper) {
+                              setSelectedPaperScreenPosition({
+                                x: Math.max(120, window.innerWidth * 0.42),
+                                y: Math.max(90, window.innerHeight * 0.25),
+                              });
+                            } else {
+                              setSelectedPaperScreenPosition(null);
+                            }
+                          }}
+                          className="text-[10px] px-2 py-0.5 rounded border transition-all hover:brightness-110"
+                          style={{
+                            color: citeColor,
+                            borderColor: `${citeColor}66`,
+                            backgroundColor: `${citeColor}1A`,
+                            boxShadow: `0 0 10px ${citeColor}33`,
+                          }}
+                        >
+                          证据文献 #{cid.slice(0, 8)}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
