@@ -160,3 +160,26 @@ class VectorStore:
 
     def chunks_count(self) -> int:
         return self._chunks_col.count()
+
+    # ------------------------------------------------------------------ #
+    # 维护接口
+    # ------------------------------------------------------------------ #
+
+    def reset_all(self) -> None:
+        """清空两张向量表（切换 embedding 模型时必须做，否则维度冲突）。"""
+        try:
+            self._client.delete_collection(self._PAPERS_COL)
+        except Exception:
+            pass
+        try:
+            self._client.delete_collection(self._CHUNKS_COL)
+        except Exception:
+            pass
+        self._papers_col = self._client.get_or_create_collection(
+            name=self._PAPERS_COL,
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._chunks_col = self._client.get_or_create_collection(
+            name=self._CHUNKS_COL,
+            metadata={"hnsw:space": "cosine"},
+        )

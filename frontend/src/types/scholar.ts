@@ -4,6 +4,7 @@ export type Paper = {
   displayTitle: string;
   firstSentence: string;
   abstract: string;     // 新增：摘要
+  llmSummary?: string;  // AI 润色后的摘要（可选，优先展示）
   filename: string;     // 新增：文件名
   field: string;        // 新增：领域/聚类名称
   confidence: number;   // 新增：置信度 (0.0 - 1.0)
@@ -31,5 +32,8 @@ export type QueryResponse = {
   answer: string;
   cites: Array<string | { paper_id?: string; chunk_id?: string; snippet?: string }>;
   cite_details?: Array<{ paper_id: string; chunk_id?: string; snippet?: string }>;
-  provider_used?: 'local' | 'gemini';
+  provider_used?: string;  // 'local' | 'gemini' | 'system' | 自定义模型 id
+  mode?: 'rag' | 'rag_soft' | 'chat';
+  status?: string;
+  message?: string;
 };

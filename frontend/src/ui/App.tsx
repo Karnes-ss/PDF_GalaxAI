@@ -1,10 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
-import { Activity, BookOpen, Compass, FileText, Search, Send, Sparkles, Upload, X, Zap } from 'lucide-react';
-import { deletePaper, fetchGraph, fileUrl, queryWithProvider, uploadPdf } from '../api/client';
+import { Activity, BookOpen, Compass, FileText, MessageSquare, Paperclip, Search, Send, Sparkles, Upload, X, Zap } from 'lucide-react';
+import { deletePaper, fetchGraph, fileUrl, queryWithProvider, uploadPdf, type AssistantMode } from '../api/client';
 import GalaxyArea from './GalaxyArea';
+import IndexAdmin from './IndexAdmin';
+import MarkdownMessage from './MarkdownMessage';
+import ModelPicker from './ModelPicker';
 import PaperDetail from './PaperDetail';
 import ReaderModal from './ReaderModal';
 import type { Edge, Paper } from '../types/scholar';
+
+const LLM_PROVIDER_STORAGE_KEY = 'scholar:llm-provider';
+const ASSISTANT_MODE_STORAGE_KEY = 'scholar:assistant-mode';
 
 export function App() {
   const [papers, setPapers] = useState<Paper[]>([]);
@@ -19,8 +25,54 @@ export function App() {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [llmProvider, setLlmProvider] = useState<'local' | 'gemini'>('local');
+  const [llmProvider, setLlmProvider] = useState<string>(() => {
+    try {
+      return localStorage.getItem(LLM_PROVIDER_STORAGE_KEY) || 'local';
+    } catch {
+      return 'local';
+    }
+  });
+
+  const [assistantMode, setAssistantMode] = useState<AssistantMode>(() => {
+    try {
+      const v = localStorage.getItem(ASSISTANT_MODE_STORAGE_KEY);
+      if (v === 'chat' || v === 'rag' || v === 'auto') return v;
+    } catch {
+      // ignore
+    }
+    return 'auto';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LLM_PROVIDER_STORAGE_KEY, llmProvider);
+    } catch {
+      // ignore quota / private mode errors
+    }
+  }, [llmProvider]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ASSISTANT_MODE_STORAGE_KEY, assistantMode);
+    } catch {
+      // ignore
+    }
+  }, [assistantMode]);
   const [activeHighlights, setActiveHighlights] = useState<string[]>([]);
+  // 对话框附加的文献（右键节点 / 点击「加入对话」加进来）
+  const [attachedPapers, setAttachedPapers] = useState<Paper[]>([]);
+
+  const handleAddPaperToChat = (p: Paper) => {
+    setAttachedPapers((prev) => {
+      if (prev.some((x) => x.id === p.id)) return prev;
+      return [...prev, p];
+    });
+  };
+
+  const handleRemoveAttached = (id: string) => {
+    setAttachedPapers((prev) => prev.filter((p) => p.id !== id));
+  };
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const htmlPortalTargetRef = useRef<HTMLDivElement>(null);
@@ -112,16 +164,47 @@ export function App() {
 
   const handleSend = async () => {
     if (!input.trim()) return;
-    const msg = input;
+    const userVisibleMsg = input;
     setInput('');
-    
-    // 立即显示用户消息
-    setChat((prev) => [...prev, { role: 'user', text: msg }]);
+
+    // 有附加文献时，把文献清单前置到实际发给后端的 question 里，方便命中 RAG 与标题匹配
+    const attachedSnapshot = attachedPapers;
+    const backendMsg = attachedSnapshot.length
+      ? (
+        '【已选定以下文献作为重点参考】\n'
+        + attachedSnapshot
+            .map((p, i) => `${i + 1}. 《${p.displayTitle || p.title || p.filename}》(paper_id=${p.id})`)
+            .join('\n')
+        + '\n\n用户问题：\n'
+        + userVisibleMsg
+      )
+      : userVisibleMsg;
+
+    // 聊天气泡里只展示用户原话 + 附加文献 chip，不展示 prompt 前缀
+    setChat((prev) => [
+      ...prev,
+      {
+        role: 'user',
+        text: userVisibleMsg,
+        cites: attachedSnapshot.length ? attachedSnapshot.map((p) => p.id) : undefined,
+      },
+    ]);
     setActiveHighlights([]);
+    setAttachedPapers([]);
     setLoading(true);
 
     try {
-      const res = await queryWithProvider(msg, llmProvider);
+      // 取最近 6 条（3 轮）作为多轮对话历史；过滤掉首条欢迎语与空消息
+      const recent = chat
+        .filter((c) => c.text && c.role !== 'system')
+        .slice(-6)
+        .map((c) => ({
+          role: (c.role === 'ai' ? 'ai' : 'user') as 'user' | 'ai',
+          text: c.text,
+        }));
+      // 有附加文献时，自动走 rag 模式，确保优先基于这些文献作答
+      const effectiveMode = attachedSnapshot.length ? 'rag' : assistantMode;
+      const res = await queryWithProvider(backendMsg, llmProvider, recent, effectiveMode);
       
       const answer = res.answer || 'AI 未返回内容';
       // 兼容两种引用格式：后端返回的 cites 数组 或 文本中的 [CITE:id] 标记
@@ -131,7 +214,17 @@ export function App() {
         []
       ).filter(Boolean);
         
-      const providerTag = res.provider_used === 'gemini' ? '（云端 Gemini）' : '（本地 Ollama）';
+      const pu = res.provider_used || '';
+      const providerTag =
+        pu === 'system'
+          ? '（系统）'
+          : pu === 'gemini'
+          ? '（云端 Gemini）'
+          : pu === 'local'
+          ? '（本地 Ollama）'
+          : pu
+          ? `（${pu}）`
+          : '';
       setChat((prev) => [...prev, { role: 'ai', text: `${answer}\n\n${providerTag}`, cites }]);
       setActiveHighlights(cites);
     } catch (err) {
@@ -175,8 +268,16 @@ export function App() {
     // focusTarget is selectedPaper which will be passed into GalaxyArea
   };
 
-  const handleDeleteSelectedPaper = async (paper: Paper) => {
-    const ok = window.confirm(`确认删除文献「${paper.displayTitle || paper.title}」吗？此操作不可撤销。`);
+  const handleDeleteSelectedPaper = async (
+    paper: Paper,
+    options: { purgeSource?: boolean } = {},
+  ) => {
+    const purgeSource = options.purgeSource ?? true;
+    const ok = window.confirm(
+      purgeSource
+        ? `确认彻底删除文献「${paper.displayTitle || paper.title}」吗？\n\n这会删除知识库记录 + inbox 源文件，重启后不会回流。`
+        : `确认仅从知识库移除「${paper.displayTitle || paper.title}」吗？\n\n将保留 inbox 源文件，之后可再次导入。`,
+    );
     if (!ok) return;
 
     const originalPapers = [...papers];
@@ -195,7 +296,7 @@ export function App() {
       setEdges(prev => prev.filter(e => e.source !== paper.id && e.target !== paper.id));
 
       console.log(`[delete] Starting delete of ${paper.id}`);
-      await deletePaper(paper.id);
+      await deletePaper(paper.id, { purgeSource });
       console.log(`[delete] Delete request completed`);
 
       // Wait for backend processing
@@ -227,7 +328,15 @@ export function App() {
       setPapers(g.papers);
       setEdges(g.edges);
       
-      setChat((prev) => [...prev, { role: 'ai', text: `🗑️ 已删除文献：${paper.displayTitle || paper.title}` }]);
+      setChat((prev) => [
+        ...prev,
+        {
+          role: 'ai',
+          text: purgeSource
+            ? `🗑️ 已彻底删除文献：${paper.displayTitle || paper.title}（含源文件）`
+            : `🗑️ 已从知识库移除：${paper.displayTitle || paper.title}（保留源文件）`,
+        },
+      ]);
     } catch (error) {
       console.error('Delete failed:', error);
       // Revert optimistic updates on failure
@@ -286,6 +395,7 @@ export function App() {
           setSelectedPaperScreenPosition(screenPos);
           setHighlightedSearchPaperId(null);
         }}
+        onRequestAddToChat={handleAddPaperToChat}
         highlights={activeHighlights}
         hideLabels={!!readerPaper}
         searchText={searchText}
@@ -308,15 +418,43 @@ export function App() {
           }}
           onOpenReader={(p) => setReaderPaper(p)}
           onDelete={handleDeleteSelectedPaper}
+          onAddToChat={handleAddPaperToChat}
+          onReprocessed={async (paperId) => {
+            try {
+              const g = await fetchGraph();
+              setPapers(g.papers);
+              setEdges(g.edges);
+              const refreshed = g.papers.find((p) => p.id === paperId) || null;
+              if (refreshed) setSelectedPaper(refreshed);
+            } catch (e) {
+              console.warn('[reprocess] refresh graph failed', e);
+            }
+          }}
+          onSummaryUpdated={(paperId, summary) => {
+            setPapers((prev) =>
+              prev.map((p) => (p.id === paperId ? { ...p, llmSummary: summary } : p))
+            );
+            setSelectedPaper((prev) =>
+              prev && prev.id === paperId ? { ...prev, llmSummary: summary } : prev
+            );
+          }}
           screenPosition={selectedPaperScreenPosition}
           aiChatWidth={420}
+          llmProvider={llmProvider}
         />
       )}
 
       <div ref={htmlPortalTargetRef} id="html-portal-target" className="absolute inset-0 pointer-events-none z-0"></div>
 
       {/* 阅读器弹层（抽离为 ReaderModal） */}
-      {readerPaper && <ReaderModal readerPaper={readerPaper} onClose={() => setReaderPaper(null)} />}
+      {readerPaper && (
+        <ReaderModal
+          readerPaper={readerPaper}
+          onClose={() => setReaderPaper(null)}
+          llmProvider={llmProvider}
+          onProviderChange={setLlmProvider}
+        />
+      )}
 
       {/* 右侧 AI 终端 */}
       <aside className="w-[420px] border-l border-white/10 glass flex flex-col z-50">
@@ -325,31 +463,49 @@ export function App() {
             <Sparkles className="w-4 h-4 text-yellow-400" /> 本地检索终端
           </h2>
           <div className="flex items-center gap-2">
-            <div className="flex items-center rounded-md border border-white/20 bg-white/5 p-0.5">
-              <button
-                onClick={() => setLlmProvider('local')}
-                className={`text-[11px] px-2 py-1 rounded transition-all ${
-                  llmProvider === 'local'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-white/10'
-                }`}
-              >
-                本地 Ollama
-              </button>
-              <button
-                onClick={() => setLlmProvider('gemini')}
-                className={`text-[11px] px-2 py-1 rounded transition-all ${
-                  llmProvider === 'gemini'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-white/10'
-                }`}
-              >
-                云端 Gemini
-              </button>
-            </div>
-            <div className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full border border-green-500/30">
-              RAG ACTIVE
-            </div>
+            <IndexAdmin />
+            <ModelPicker
+              currentProviderId={llmProvider}
+              onProviderChange={setLlmProvider}
+            />
+          </div>
+        </div>
+
+        {/* 模式切换条 */}
+        <div className="px-6 pt-3 pb-2 border-b border-white/10 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1 p-1 rounded-full bg-white/5 border border-white/10">
+            {([
+              { id: 'auto', label: '自适应', icon: Sparkles, hint: '根据提问自动判断是否检索文献' },
+              { id: 'rag', label: '文献问答', icon: BookOpen, hint: '强制基于你的文献库作答并溯源' },
+              { id: 'chat', label: '通用对话', icon: MessageSquare, hint: '纯大模型对话，不检索不引用' },
+            ] as const).map((m) => {
+              const active = assistantMode === m.id;
+              const Icon = m.icon;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => setAssistantMode(m.id)}
+                  title={m.hint}
+                  className={`flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-full transition-all
+                    ${active
+                      ? 'bg-indigo-500/25 text-indigo-100 ring-1 ring-indigo-400/40 shadow-sm shadow-indigo-500/20'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'}`}
+                >
+                  <Icon className="w-3 h-3" />
+                  {m.label}
+                </button>
+              );
+            })}
+          </div>
+          <div
+            className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+              assistantMode === 'chat'
+                ? 'bg-slate-500/10 text-slate-400 border-slate-500/30'
+                : 'bg-green-500/15 text-green-400 border-green-500/30'
+            }`}
+          >
+            {assistantMode === 'chat' ? 'CHAT ONLY' : 'RAG ACTIVE'}
           </div>
         </div>
 
@@ -357,11 +513,15 @@ export function App() {
           {chat.map((m, i) => (
             <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div
-                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap break-words break-all ${
-                  m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-white/5 border border-white/10'
+                className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed break-words ${
+                  m.role === 'user' ? 'bg-indigo-600 text-white whitespace-pre-wrap' : 'bg-white/5 border border-white/10'
                 }`}
               >
-                {m.text}
+                {m.role === 'user' ? (
+                  m.text
+                ) : (
+                  <MarkdownMessage text={m.text} />
+                )}
                 {m.cites && m.cites.length > 0 && (
                   <div className="mt-4 pt-3 border-t border-white/10 flex flex-wrap gap-2">
                     {m.cites.map((cid) => {
@@ -411,12 +571,50 @@ export function App() {
         </div>
 
         <div className="p-4 bg-black/40 border-t border-white/10">
+          {attachedPapers.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {attachedPapers.map((p) => (
+                <span
+                  key={p.id}
+                  className="group/chip inline-flex items-center gap-1 max-w-full pl-2 pr-1 py-1 rounded-lg text-[11px] border"
+                  style={{
+                    color: p.color || '#c7d2fe',
+                    borderColor: `${p.color || '#6366f1'}55`,
+                    backgroundColor: `${p.color || '#6366f1'}18`,
+                  }}
+                  title={p.displayTitle || p.title || p.filename}
+                >
+                  <Paperclip className="w-3 h-3 opacity-80" />
+                  <span className="truncate max-w-[220px]">{p.displayTitle || p.title || p.filename}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveAttached(p.id)}
+                    className="ml-0.5 p-0.5 rounded hover:bg-white/15 transition-colors"
+                    title="移除"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={() => setAttachedPapers([])}
+                className="text-[10px] text-slate-500 hover:text-slate-300 px-1.5"
+              >
+                清空
+              </button>
+            </div>
+          )}
           <div className="relative group">
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
-              placeholder="提问，AI将检索整个星系的知识..."
+              placeholder={
+                attachedPapers.length
+                  ? `针对附加的 ${attachedPapers.length} 篇文献提问…`
+                  : '提问，AI将检索整个星系的知识...（在星图中右键/Ctrl+Click 节点可添加到对话）'
+              }
               className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 pr-14 text-sm outline-none focus:border-indigo-500/50 min-h-[100px] resize-none transition-all"
             />
             <button

@@ -48,6 +48,7 @@ function PaperNode({
   paper,
   isHighlighted,
   onSelect,
+  onRequestAddToChat,
   hideLabels,
   isSelected,
   htmlPortalTargetRef
@@ -55,6 +56,7 @@ function PaperNode({
   paper: Paper;
   isHighlighted: boolean;
   onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
+  onRequestAddToChat?: (p: Paper) => void;
   hideLabels?: boolean;
   isSelected: boolean;
   htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
@@ -74,12 +76,25 @@ function PaperNode({
       <mesh 
         onClick={(e) => {
           e.stopPropagation();
+          // Ctrl/Cmd/Shift+Click：添加到对话框（与右键等价，避免浏览器环境吞右键）
+          const native = e.nativeEvent as MouseEvent;
+          if (native.ctrlKey || native.metaKey || native.shiftKey) {
+            if (onRequestAddToChat) {
+              onRequestAddToChat(paper);
+              return;
+            }
+          }
           // Calculate screen position based on actual canvas position within the window
           const vector = position.clone().project(camera);
           const canvasBounds = gl.domElement.getBoundingClientRect();
           const x = canvasBounds.left + (vector.x * 0.5 + 0.5) * canvasBounds.width;
           const y = canvasBounds.top + (-vector.y * 0.5 + 0.5) * canvasBounds.height;
           onSelect(paper, { x, y }); // Pass window-relative screen position
+        }}
+        onContextMenu={(e) => {
+          e.stopPropagation();
+          e.nativeEvent.preventDefault();
+          onRequestAddToChat?.(paper);
         }}
         onPointerOver={() => setHover(true)}
         onPointerOut={() => setHover(false)}
@@ -109,7 +124,7 @@ function PaperNode({
 
       {/* 3. 科技感文字标签 */}
       {!hideLabels && (
-        <Html distanceFactor={15} position={[0, 0.9, 0]} center portal={htmlPortalTargetRef.current || undefined}>
+        <Html distanceFactor={15} position={[0, 0.9, 0]} center portal={htmlPortalTargetRef}>
           <div style={{
             pointerEvents: 'none',
             background: hovered ? 'rgba(2, 6, 12, 0.9)' : 'rgba(2, 6, 12, 0.4)',
@@ -138,6 +153,7 @@ export function GalaxyRenderer({
   papers,
   edges,
   onSelect,
+  onRequestAddToChat,
   highlights,
   hideLabels,
   focusTarget,
@@ -146,6 +162,7 @@ export function GalaxyRenderer({
   papers: Paper[];
   edges: Edge[];
   onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
+  onRequestAddToChat?: (p: Paper) => void;
   highlights: string[];
   hideLabels?: boolean;
   focusTarget?: Paper | null;
@@ -207,7 +224,10 @@ export function GalaxyRenderer({
   }
 
   return (
-    <div style={{ width: '100%', height: '100%', background: '#010204', position: 'relative' }}>
+    <div
+      style={{ width: '100%', height: '100%', background: '#010204', position: 'relative' }}
+      onContextMenu={(e) => e.preventDefault()}
+    >
       <Canvas 
         camera={{ position: [0, 0, 60], fov: 50 }}
         gl={{ 
@@ -249,6 +269,7 @@ export function GalaxyRenderer({
             paper={paper} 
             isHighlighted={highlightSet.has(paper.id)}
             onSelect={onSelect}
+            onRequestAddToChat={onRequestAddToChat}
             hideLabels={hideLabels}
             isSelected={paper.id === focusTarget?.id}
             htmlPortalTargetRef={htmlPortalTargetRef}
@@ -266,7 +287,7 @@ export function GalaxyRenderer({
         />
 
         {/* 关键渲染步骤：辉光后期处理 */}
-        <EffectComposer disableNormalPass>
+        <EffectComposer>
           <Bloom 
             luminanceThreshold={0.15} 
             intensity={1.8} 

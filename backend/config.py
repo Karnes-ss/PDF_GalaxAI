@@ -10,6 +10,7 @@ PAPERS_JSON = DATA_DIR / "papers.json"
 INBOX_DIR = Path(os.getenv("SCHOLAR_INBOX_DIR") or (DATA_DIR / "inbox")).resolve()
 
 CHROMA_DIR = DATA_DIR / "chroma"
+CUSTOM_MODELS_JSON = DATA_DIR / "custom_models.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 FILES_DIR.mkdir(parents=True, exist_ok=True)

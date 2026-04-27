@@ -44,3 +44,26 @@ canvas {
 .highlight-paper {
   animation: pulse-gold 2s infinite;
 }
+
+/* 聊天气泡里的 Markdown / 数学公式样式微调 */
+.markdown-body {
+  color: inherit;
+}
+.markdown-body :where(p, ul, ol, blockquote, pre, table):last-child {
+  margin-bottom: 0;
+}
+.markdown-body .katex {
+  color: #f1f5f9;
+  font-size: 1.02em;
+}
+.markdown-body .katex-display {
+  margin: 0.6em 0;
+  padding: 0.35em 0.5em;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.markdown-body .katex-display > .katex {
+  white-space: nowrap;
+}

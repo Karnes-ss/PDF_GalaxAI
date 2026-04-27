@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "backend": "cd backend && python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000",
+    "backend:py3": "cd backend && python3 -m uvicorn main:app --reload --host 127.0.0.1 --port 8000",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -13,9 +14,14 @@
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
     "@react-three/postprocessing": "^3.0.4",
+    "katex": "^0.16.45",
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "three": "^0.182.0"
   },
   "devDependencies": {

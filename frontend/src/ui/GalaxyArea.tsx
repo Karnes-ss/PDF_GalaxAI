@@ -7,6 +7,7 @@ interface Props {
   papers: Paper[];
   edges: Edge[];
   onSelect: (p: Paper, screenPos: { x: number; y: number }) => void;
+  onRequestAddToChat?: (p: Paper) => void;
   highlights?: string[];
   hideLabels?: boolean;
   searchText: string;
@@ -18,7 +19,7 @@ interface Props {
   htmlPortalTargetRef: React.RefObject<HTMLDivElement>;
 }
 
-export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLabels, searchText, setSearchText, results, onResultClick, focusTarget, highlightedSearchPaperId, htmlPortalTargetRef }: Props) {
+export default function GalaxyArea({ papers, edges, onSelect, onRequestAddToChat, highlights, hideLabels, searchText, setSearchText, results, onResultClick, focusTarget, highlightedSearchPaperId, htmlPortalTargetRef }: Props) {
   const combinedHighlights = Array.from(new Set([...(highlights || []), ...(highlightedSearchPaperId ? [highlightedSearchPaperId] : [])]));
   return (
     <main className="flex-1 relative">
@@ -55,6 +56,7 @@ export default function GalaxyArea({ papers, edges, onSelect, highlights, hideLa
         papers={papers}
         edges={edges}
         onSelect={(p, screenPos) => onSelect(p, screenPos)}
+        onRequestAddToChat={onRequestAddToChat}
         highlights={combinedHighlights}
         hideLabels={!!hideLabels}
         focusTarget={focusTarget}

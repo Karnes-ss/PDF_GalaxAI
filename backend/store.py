@@ -23,16 +23,21 @@ except ImportError:
 from chunker import chunk_text
 from clustering import cluster_palette, reduce_to_3d
 from config import FILES_DIR, INBOX_DIR, PAPERS_JSON
+from keyword_extractor import GlobalKeywordExtractor
+from summarizer import extractive_summary
 from text_processing import (
     clean_text,
     extract_abstract_block,
     extract_keywords_block,
     extract_title_from_text,
+    read_pdf_pages,
     read_pdf_text,
     safe_stem,
-    tfidf_keywords_block,
 )
 from vector_store import VectorStore
+
+
+_ABSTRACT_ANCHOR_RE = re.compile(r"(abstract|摘要)[:：]?\s", re.IGNORECASE)
 
 
 class ScholarStore:
@@ -48,12 +53,23 @@ class ScholarStore:
         self._papers: list[dict[str, Any]] = []
         self._vectors: np.ndarray | None = None   # 运行时缓存，不持久化
         self._model = None
-        self._model_name = os.getenv("SCHOLAR_ST_MODEL") or "all-MiniLM-L6-v2"
+        # 默认换成 BAAI/bge-m3：多语言 + 学术术语友好，1024 维，比 MiniLM(384) 强非常多。
+        # 首次加载需要下载 ~2.3GB 模型，之后会走 HF cache。
+        # 若要切换，改环境变量 SCHOLAR_ST_MODEL（比如用纯中文的 BAAI/bge-large-zh-v1.5）。
+        self._model_name = os.getenv("SCHOLAR_ST_MODEL") or "BAAI/bge-m3"
         self._offline = (
             (os.getenv("SCHOLAR_OFFLINE") or "").strip().lower()
             in {"1", "true", "yes"}
         )
         self._vstore: VectorStore | None = None
+        # 记录当前库里向量来自哪个模型；换模型后检测到不一致时会警告
+        self._last_emb_model: str | None = None
+
+        # 全库关键词提取器：
+        # _kw_corpus 保留每篇论文的清洗后全文，用于跨文献 TF-IDF。
+        # 上传 / 删除时同步更新，下次 extract 时懒重建 TF-IDF。
+        self._kw_extractor = GlobalKeywordExtractor()
+        self._kw_corpus: dict[str, str] = {}
 
         self._load_db()
 
@@ -102,24 +118,33 @@ class ScholarStore:
             data = json.loads(PAPERS_JSON.read_text(encoding="utf-8"))
             with self._lock:
                 papers = data.get("papers", [])
-                # 兼容旧格式：去掉可能残留的 vectors 字段（节省内存）
                 for p in papers:
                     p.pop("vectors", None)
                 self._papers = papers
+                self._last_emb_model = data.get("emb_model") or None
             print(f"[store] Loaded {len(self._papers)} papers from JSON")
+            if self._last_emb_model and self._last_emb_model != self._model_name:
+                print(
+                    f"[store] ⚠ Embedding model changed: "
+                    f"was '{self._last_emb_model}', now '{self._model_name}'. "
+                    f"向量维度/语义都不兼容，请在 UI 里点『重建全库索引』。"
+                )
         except Exception as e:
             print(f"[store] Failed to load DB: {e}")
 
     def _save_db(self) -> None:
         """将论文元信息与 UI 状态持久化到 JSON（不含向量）。"""
         try:
-            # 保存前确保不含向量字段
             papers_clean = [
                 {k: v for k, v in p.items() if k != "vectors"}
                 for p in self._papers
             ]
+            payload = {
+                "papers": papers_clean,
+                "emb_model": self._last_emb_model or self._model_name,
+            }
             PAPERS_JSON.write_text(
-                json.dumps({"papers": papers_clean}, ensure_ascii=False, indent=2),
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as e:
@@ -181,6 +206,249 @@ class ScholarStore:
         score = max(0.0, min(1.0, 0.65 * (1.0 - bad_ratio) + 0.35 * readable_ratio))
         return score
 
+    # ------------------------------------------------------------------ #
+    # 关键词语料维护
+    # ------------------------------------------------------------------ #
+
+    def _register_corpus(self, paper_id: str, cleaned_text: str) -> None:
+        """把一篇论文的清洗文本加入全库语料（用于跨文献 TF-IDF）。"""
+        self._kw_corpus[paper_id] = cleaned_text or ""
+        self._kw_extractor.add(paper_id, cleaned_text or "")
+
+    def _unregister_corpus(self, paper_id: str) -> None:
+        self._kw_corpus.pop(paper_id, None)
+        self._kw_extractor.remove(paper_id)
+
+    def _auto_keywords(
+        self,
+        paper_id: str,
+        top_k: int = 8,
+        title: str = "",
+        abstract: str = "",
+    ) -> list[str]:
+        """基于当前全库 TF-IDF 给指定论文生成关键词。"""
+        try:
+            return self._kw_extractor.extract(
+                paper_id, top_k=top_k, title=title, abstract=abstract
+            )
+        except Exception as e:
+            print(f"[store] keyword extraction failed for {paper_id}: {e}")
+            return []
+
+    def _build_best_abstract(self, cleaned: str) -> str:
+        """
+        统一的"最佳摘要"策略：
+          1. 原文含 Abstract / 摘要 段 → 直接使用（最权威）
+          2. 否则 → TextRank + MMR 抽取式摘要
+          3. 两者都失败 → extract_abstract_block 的段落兜底
+        """
+        if not cleaned:
+            return ""
+        if _ABSTRACT_ANCHOR_RE.search(cleaned):
+            return extract_abstract_block(cleaned)
+        try:
+            model = self._ensure_model()
+        except Exception:
+            model = None
+        summary = extractive_summary(cleaned, model, max_sentences=4, max_chars=420)
+        if summary:
+            return summary
+        return extract_abstract_block(cleaned)
+
+    def rebuild_index_for_all(self) -> dict[str, int]:
+        """
+        对所有已入库文献"清向量 + 重新切块 + 重新向量化"。
+        不改 pos/cluster/color/size（等所有重建完一次性 _recompute_locked）。
+        适用于：修改过 PDF 抽取策略（如 OCR 模式切换）后，让 RAG 召回立即生效。
+        """
+        with self._lock:
+            papers = list(self._papers)
+
+        if not papers:
+            return {"total": 0, "rebuilt": 0, "skipped_missing_pdf": 0, "failed": 0}
+
+        try:
+            vstore = self._ensure_vstore()
+        except Exception as e:
+            print(f"[store] rebuild_index: vstore unavailable: {e}")
+            return {"total": len(papers), "rebuilt": 0, "skipped_missing_pdf": 0, "failed": len(papers)}
+
+        rebuilt, skipped_missing_pdf, failed = 0, 0, 0
+        for p in papers:
+            pid = str(p.get("id") or "")
+            if not pid:
+                continue
+            pdf_path = FILES_DIR / f"{pid}.pdf"
+            if not pdf_path.exists():
+                skipped_missing_pdf += 1
+                continue
+            try:
+                cleaned = clean_text(read_pdf_text(pdf_path, max_pages=0))
+                if not cleaned or len(cleaned) < 30:
+                    failed += 1
+                    continue
+
+                # 清掉旧的 paper 向量 + 全部 chunks
+                try:
+                    vstore.delete_paper(pid)
+                except Exception as e:
+                    print(f"[store] rebuild_index: delete_paper({pid}) warn: {e}")
+
+                # 刷新全库语料（关键词也会更新）
+                self._register_corpus(pid, cleaned)
+
+                # 读取当前 paper 的元信息（外层 papers list 是副本，重新定位）
+                with self._lock:
+                    target = next(
+                        (x for x in self._papers if str(x.get("id") or "") == pid),
+                        None,
+                    )
+                    paper_snapshot = dict(target) if target else None
+
+                if paper_snapshot is None:
+                    failed += 1
+                    continue
+
+                self._index_paper(paper_snapshot, cleaned)
+                rebuilt += 1
+            except Exception as e:
+                print(f"[store] rebuild_index failed for {pid}: {e}")
+                failed += 1
+
+        # 最后一次性重算聚类/坐标
+        try:
+            with self._lock:
+                self._recompute_locked()
+        except Exception as e:
+            print(f"[store] rebuild_index: _recompute_locked warn: {e}")
+
+        # 语料也变了，刷一次自动关键词
+        try:
+            kw_updated = self.refresh_keywords_for_all()
+        except Exception as e:
+            print(f"[store] rebuild_index: refresh_keywords warn: {e}")
+            kw_updated = 0
+
+        return {
+            "total": len(papers),
+            "rebuilt": rebuilt,
+            "skipped_missing_pdf": skipped_missing_pdf,
+            "failed": failed,
+            "keyword_updated": kw_updated,
+        }
+
+    def refresh_previews_for_all(self) -> dict[str, int]:
+        """
+        重算所有已存在论文的「预览字段」：title / abstract / first_sentence /
+        自动关键词。不触碰 Chroma 向量、不改 pos/cluster/color/size，仅刷新
+        文本层面展示内容。返回统计信息。
+
+        适用场景：升级 clean_text / extract_abstract_block 后，让已入库文献
+        的预览框立即生效，而不需要用户重新上传。
+        """
+        with self._lock:
+            papers = list(self._papers)
+
+        updated, skipped_missing_pdf, failed = 0, 0, 0
+        for p in papers:
+            pid = str(p.get("id") or "")
+            if not pid:
+                continue
+            pdf_path = FILES_DIR / f"{pid}.pdf"
+            if not pdf_path.exists():
+                skipped_missing_pdf += 1
+                continue
+            try:
+                full_text = read_pdf_text(pdf_path, max_pages=0)
+                cleaned = clean_text(full_text)
+                if not cleaned or len(cleaned) < 30:
+                    failed += 1
+                    continue
+
+                display_title = str(
+                    p.get("display_title")
+                    or safe_stem(str(p.get("filename") or "")) or pid
+                )
+                new_title = extract_title_from_text(cleaned, display_title)
+                new_abstract = self._build_best_abstract(cleaned)
+
+                first_sentence = ""
+                try:
+                    m = re.search(r"[^.!?。！？]+[.!?。！？]", cleaned)
+                    first_sentence = (
+                        m.group(0).strip() if m else cleaned[:100].strip() + "..."
+                    )
+                except Exception:
+                    first_sentence = cleaned[:100].strip() + "..."
+
+                # 刷新该论文在全库语料中的内容（影响后续关键词提取）
+                self._register_corpus(pid, cleaned)
+
+                with self._lock:
+                    # 用 id 重新定位（避免期间有并发变更）
+                    target = next(
+                        (x for x in self._papers if str(x.get("id") or "") == pid),
+                        None,
+                    )
+                    if target is None:
+                        continue
+                    target["title"] = new_title
+                    target["abstract"] = new_abstract
+                    target["first_sentence"] = first_sentence
+                    target["display_title"] = display_title
+
+                updated += 1
+            except Exception as e:
+                print(f"[store] refresh_previews failed for {pid}: {e}")
+                failed += 1
+
+        # 语料整体更新完之后再刷一次自动关键词（declared 的会被保留）
+        try:
+            kw_updated = self.refresh_keywords_for_all()
+        except Exception as e:
+            print(f"[store] refresh_keywords_for_all after previews failed: {e}")
+            kw_updated = 0
+
+        with self._lock:
+            self._save_db()
+
+        return {
+            "total": len(papers),
+            "updated": updated,
+            "keyword_updated": kw_updated,
+            "skipped_missing_pdf": skipped_missing_pdf,
+            "failed": failed,
+        }
+
+    def refresh_keywords_for_all(self, top_k: int = 8) -> int:
+        """
+        对全库每篇论文重算关键词（基于最新语料）。
+        仅覆盖"论文自带 Keywords 段"之外的情形（保留人工/官方关键词）。
+        返回被更新的篇数。
+        """
+        with self._lock:
+            updated = 0
+            for p in self._papers:
+                pid = str(p.get("id") or "")
+                if not pid:
+                    continue
+                # 如果论文本身带有 Keywords 段（_keywords_source == "declared"），保留
+                if p.get("_keywords_source") == "declared":
+                    continue
+                new_kws = self._auto_keywords(
+                    pid,
+                    top_k=top_k,
+                    title=str(p.get("title") or ""),
+                    abstract=str(p.get("abstract") or ""),
+                )
+                if new_kws:
+                    p["keywords"] = new_kws
+                    p["_keywords_source"] = "auto"
+                    updated += 1
+            if updated > 0:
+                self._save_db()
+            return updated
+
     def _index_paper(self, paper: dict[str, Any], full_text: str) -> None:
         """
         对单篇论文做向量化并写入 VectorStore（论文级 + Chunk 级）。
@@ -216,8 +484,10 @@ class ScholarStore:
 
     def ensure_all_indexed(self) -> None:
         """
-        启动时调用：检查 JSON 中已有论文是否在 Chroma 里有向量；
-        若缺失则从对应 PDF 文件重新索引（兼容旧数据迁移）。
+        启动时调用：
+          1. 检查 JSON 中已有论文是否在 Chroma 里有向量；缺失则重新索引
+          2. 顺便把每篇论文的清洗全文注册进全库关键词语料
+          3. 完成后若有新增注册，全局重算一次关键词
         """
         with self._lock:
             papers = list(self._papers)
@@ -229,29 +499,61 @@ class ScholarStore:
             vstore = self._ensure_vstore()
         except Exception as e:
             print(f"[store] VectorStore unavailable, skipping index check: {e}")
+            vstore = None
+
+        missing_vec_ids: set[str] = set()
+        if vstore is not None:
+            missing_vec_ids = {p["id"] for p in papers if not vstore.has_paper(p["id"])}
+
+        # 缺语料的：只要在语料里没有就补（保证关键词始终能算）
+        missing_corpus_ids = {p["id"] for p in papers if p["id"] not in self._kw_corpus}
+
+        need_ids = missing_vec_ids | missing_corpus_ids
+        if not need_ids:
             return
 
-        missing = [p for p in papers if not vstore.has_paper(p["id"])]
-        if not missing:
-            return
+        if missing_vec_ids:
+            print(f"[store] Re-indexing {len(missing_vec_ids)} papers missing from Chroma ...")
+        if missing_corpus_ids:
+            print(f"[store] Registering {len(missing_corpus_ids)} papers into keyword corpus ...")
 
-        print(f"[store] Re-indexing {len(missing)} papers missing from Chroma ...")
-        for paper in missing:
+        for paper in papers:
+            if paper["id"] not in need_ids:
+                continue
             pdf_path = FILES_DIR / f"{paper['id']}.pdf"
             if not pdf_path.exists():
                 print(f"[store] PDF missing for {paper['id']}, skipping")
                 continue
             try:
-                full_text = clean_text(read_pdf_text(pdf_path, max_pages=0))
-                self._index_paper(paper, full_text)
+                cleaned = clean_text(read_pdf_text(pdf_path, max_pages=0))
+                # 语料（无论是否缺向量都补一次）
+                self._register_corpus(paper["id"], cleaned)
+                # 向量（只补缺失的）
+                if paper["id"] in missing_vec_ids and vstore is not None:
+                    self._index_paper(paper, cleaned)
             except Exception as e:
                 print(f"[store] Re-index failed for {paper['id']}: {e}")
+
+        # 刚刚大量注册了语料，全局刷新一次关键词（自动关键词才会被覆盖）
+        try:
+            n = self.refresh_keywords_for_all()
+            if n > 0:
+                print(f"[store] Auto keywords refreshed for {n} papers")
+        except Exception as e:
+            print(f"[store] refresh_keywords_for_all failed: {e}")
 
     # ------------------------------------------------------------------ #
     # 添加 PDF
     # ------------------------------------------------------------------ #
 
-    def add_pdf(self, filename: str, raw: bytes, recompute: bool = True) -> str:
+    def add_pdf(
+        self,
+        filename: str,
+        raw: bytes,
+        recompute: bool = True,
+        ocr_mode: str | None = None,
+        parser: str | None = None,
+    ) -> str:
         paper_id = uuid.uuid4().hex[:10]
         pdf_path = FILES_DIR / f"{paper_id}.pdf"
         try:
@@ -260,7 +562,9 @@ class ScholarStore:
             raise ValueError(f"PDF 文件保存失败: {e}")
 
         try:
-            full_text = read_pdf_text(pdf_path, max_pages=0)   # 全文
+            full_text = read_pdf_text(
+                pdf_path, max_pages=0, mode_override=ocr_mode, parser=parser
+            )
             cleaned = clean_text(full_text)
         except Exception as e:
             if pdf_path.exists():
@@ -275,7 +579,7 @@ class ScholarStore:
         display_title = safe_stem(filename)
         try:
             title = extract_title_from_text(cleaned, display_title)
-            abstract = extract_abstract_block(cleaned)
+            abstract = self._build_best_abstract(cleaned)
         except Exception as e:
             if pdf_path.exists():
                 pdf_path.unlink()
@@ -288,13 +592,8 @@ class ScholarStore:
         except Exception:
             first_sentence = cleaned[:100].strip() + "..."
 
-        try:
-            keywords = extract_keywords_block(cleaned)
-            if not keywords:
-                keywords = tfidf_keywords_block(f"{title}\n{abstract}")
-        except Exception as e:
-            print(f"[store] Warning: keyword extraction failed: {e}")
-            keywords = [title[:20]] if title else []
+        declared_kws = extract_keywords_block(cleaned)
+        keywords_source = "declared" if declared_kws else "auto"
 
         paper: dict[str, Any] = {
             "id": paper_id,
@@ -302,7 +601,10 @@ class ScholarStore:
             "display_title": display_title,
             "abstract": abstract,
             "first_sentence": first_sentence,
-            "keywords": keywords,
+            "keywords": declared_kws,   # 先占位，下面如有 auto 再覆盖
+            "_keywords_source": keywords_source,
+            "_ocr_mode": (ocr_mode or "").strip().lower() or "auto",
+            "_parser": (parser or "").strip().lower() or "default",
             "filename": filename,
             "field": "Processing...",
             "confidence": 0.0,
@@ -310,6 +612,25 @@ class ScholarStore:
             "pos": [0.0, 0.0, 0.0],
             "size": 3.0,
         }
+
+        # 注册语料（先注册再抽关键词，保证新论文自身也进入 TF-IDF）
+        self._register_corpus(paper_id, cleaned)
+
+        # 论文没有自带 Keywords 段时，用全库 TF-IDF + MMR 提取
+        if not declared_kws:
+            try:
+                kws = self._auto_keywords(
+                    paper_id,
+                    top_k=8,
+                    title=title,
+                    abstract=abstract,
+                )
+                if not kws and title:
+                    kws = [title[:20]]
+                paper["keywords"] = kws
+            except Exception as e:
+                print(f"[store] Warning: keyword extraction failed: {e}")
+                paper["keywords"] = [title[:20]] if title else []
 
         # 向量化写入 Chroma
         try:
@@ -326,9 +647,18 @@ class ScholarStore:
                     self._save_db()
             except Exception as e:
                 self._papers.pop()
+                self._unregister_corpus(paper_id)
                 if pdf_path.exists():
                     pdf_path.unlink()
                 raise ValueError(f"图表计算失败: {e}")
+
+        # 新增一篇论文后语料扩大，给其它自动关键词的论文也刷新一下
+        # （对老论文中显式声明的 Keywords 不会动）
+        if recompute:
+            try:
+                self.refresh_keywords_for_all()
+            except Exception as e:
+                print(f"[store] Warning: refresh_keywords_for_all after add failed: {e}")
 
         return paper_id
 
@@ -339,6 +669,13 @@ class ScholarStore:
     def ingest_from_inbox(self) -> int:
         if not INBOX_DIR.exists():
             return 0
+
+        processed_dir = INBOX_DIR / "_processed"
+        try:
+            processed_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # 不阻断主流程；后面如果 move 失败会退化为保留原文件
+            pass
 
         with self._lock:
             existing = {p.get("filename") for p in self._papers}
@@ -351,6 +688,22 @@ class ScholarStore:
                 self.add_pdf(pdf_path.name, pdf_path.read_bytes(), recompute=False)
                 count += 1
                 print(f"[store] Ingested: {pdf_path.name}")
+                # 导入后把 inbox 原文件移到 _processed，避免重启时重复导入
+                try:
+                    target = processed_dir / pdf_path.name
+                    if target.exists():
+                        stem = pdf_path.stem
+                        suffix = pdf_path.suffix or ".pdf"
+                        i = 1
+                        while True:
+                            cand = processed_dir / f"{stem}__dup{i}{suffix}"
+                            if not cand.exists():
+                                target = cand
+                                break
+                            i += 1
+                    pdf_path.replace(target)
+                except Exception as move_err:
+                    print(f"[store] Warning: failed to archive inbox file {pdf_path.name}: {move_err}")
             except Exception as e:
                 print(f"[store] Error ingesting {pdf_path.name}: {e}")
 
@@ -499,22 +852,281 @@ class ScholarStore:
         with self._lock:
             return list(self._papers)
 
-    def delete_paper(self, paper_id: str) -> bool:
+    def get_paper(self, paper_id: str) -> dict[str, Any] | None:
+        """线程安全地取一份论文元数据副本。不存在返回 None。"""
+        with self._lock:
+            for p in self._papers:
+                if str(p.get("id") or "") == paper_id:
+                    return dict(p)
+        return None
+
+    def get_cleaned_fulltext(self, paper_id: str) -> str:
+        """读取并清洗某篇论文的全文（供 LLM 摘要润色等上下文使用）。"""
+        pdf_path = FILES_DIR / f"{paper_id}.pdf"
+        if not pdf_path.exists():
+            return ""
+        try:
+            return clean_text(read_pdf_text(pdf_path, max_pages=0))
+        except Exception as e:
+            print(f"[store] get_cleaned_fulltext failed for {paper_id}: {e}")
+            return ""
+
+    def get_pages_text(self, paper_id: str, pages: list[int]) -> list[tuple[int, str]]:
+        """按页码（1-based）读取指定页的清洗文本。越界或文件缺失则返回空串。
+
+        返回 [(page_num, cleaned_text), ...]，按输入顺序去重并保留。
+        """
+        pdf_path = FILES_DIR / f"{paper_id}.pdf"
+        if not pdf_path.exists() or not pages:
+            return []
+        try:
+            raw_pages = read_pdf_pages(pdf_path)
+        except Exception as e:
+            print(f"[store] read_pdf_pages failed for {paper_id}: {e}")
+            return []
+
+        total = len(raw_pages)
+        if total == 0:
+            return []
+
+        out: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for p in pages:
+            if p in seen:
+                continue
+            seen.add(p)
+            if 1 <= p <= total:
+                cleaned = clean_text(raw_pages[p - 1])
+                out.append((p, cleaned))
+            else:
+                out.append((p, ""))
+        return out
+
+    def get_page_count(self, paper_id: str) -> int:
+        """返回 PDF 页数（失败返回 0）。"""
+        pdf_path = FILES_DIR / f"{paper_id}.pdf"
+        if not pdf_path.exists():
+            return 0
+        try:
+            return len(read_pdf_pages(pdf_path))
+        except Exception:
+            return 0
+
+    def set_llm_summary(self, paper_id: str, summary: str) -> bool:
+        """写入 / 清空某篇论文的 LLM 润色摘要。返回是否命中论文。"""
+        with self._lock:
+            for p in self._papers:
+                if str(p.get("id") or "") == paper_id:
+                    if summary:
+                        p["llm_summary"] = summary
+                    else:
+                        p.pop("llm_summary", None)
+                    self._save_db()
+                    return True
+        return False
+
+    def reindex_all_papers(self) -> dict[str, Any]:
+        """
+        对全库所有论文重跑 embedding 与 chunk 向量。
+        换 embedding 模型后必须调一次（维度/语义都变了）。
+
+        流程：
+          1. 清空 Chroma 两张表（维度可能已变）
+          2. 对每篇论文：重读 PDF → clean_text → 重新 _index_paper
+          3. 更新 emb_model 字段
+
+        注意：只重跑向量，不重跑文本解析（想连文本一起重跑请用 reprocess_paper）。
+        """
+        with self._lock:
+            papers = list(self._papers)
+        if not papers:
+            return {"total": 0, "success": 0, "failed": 0, "model": self._model_name}
+
+        # 清空向量表
+        try:
+            self._ensure_vstore().reset_all()
+        except Exception as e:
+            print(f"[store] Warning: reset vectors failed: {e}")
+
+        # 让 model 真正触发一次加载（可能下载几 GB）
+        try:
+            self._ensure_model()
+        except Exception as e:
+            raise RuntimeError(f"加载 embedding 模型失败: {e}")
+
+        success, failed = 0, 0
+        for i, paper in enumerate(papers, 1):
+            pdf_path = FILES_DIR / f"{paper['id']}.pdf"
+            if not pdf_path.exists():
+                print(f"[reindex] [{i}/{len(papers)}] PDF 缺失，跳过: {paper['id']}")
+                failed += 1
+                continue
+            try:
+                print(f"[reindex] [{i}/{len(papers)}] {paper.get('filename', paper['id'])}")
+                cleaned = clean_text(read_pdf_text(pdf_path, max_pages=0))
+                if not cleaned or len(cleaned) < 50:
+                    failed += 1
+                    continue
+                self._index_paper(paper, cleaned)
+                success += 1
+            except Exception as e:
+                print(f"[reindex] failed for {paper.get('filename', paper['id'])}: {e}")
+                failed += 1
+
+        # 记录此次使用的 embedding 模型
+        with self._lock:
+            self._last_emb_model = self._model_name
+            self._save_db()
+
+        return {
+            "total": len(papers),
+            "success": success,
+            "failed": failed,
+            "model": self._model_name,
+        }
+
+    def reprocess_paper(
+        self,
+        paper_id: str,
+        ocr_mode: str | None = None,
+        parser: str | None = None,
+        recompute_geometry: bool = False,
+    ) -> dict[str, Any]:
+        """
+        按 ocr_mode（off/auto/force）重新识别指定文档的文本，并刷新：
+          - 清洗后全文 / abstract / first_sentence
+          - 关键词（仅当原本是 auto 推断的才覆盖；显式 Keywords 保留）
+          - 向量库 chunks（先删再建）
+          - 关键词语料
+        保留：id/filename/display_title/title（标题不回退，除非解析出更好的）、
+             人工 polish_summary 等用户数据。
+
+        recompute_geometry 默认 False：只刷文本/向量，不重跑聚类与坐标，
+        避免整张星系图因为一篇文献刷新而抖动。
+        """
+        with self._lock:
+            idx = next(
+                (i for i, p in enumerate(self._papers) if str(p.get("id") or "") == paper_id),
+                -1,
+            )
+            if idx < 0:
+                raise ValueError(f"paper {paper_id} not found")
+            paper = self._papers[idx]
+
+        pdf_path = FILES_DIR / f"{paper_id}.pdf"
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF missing for {paper_id}")
+
+        full_text = read_pdf_text(
+            pdf_path, max_pages=0, mode_override=ocr_mode, parser=parser
+        )
+        cleaned = clean_text(full_text)
+        if not cleaned or len(cleaned) < 50:
+            raise ValueError(
+                f"重新识别失败：提取文本过短（长度 {len(cleaned) if cleaned else 0}），"
+                "可能是扫描件且 OCR 未正确安装或语言包缺失。"
+            )
+
+        display_title = paper.get("display_title") or safe_stem(paper.get("filename", ""))
+        new_title_candidate = extract_title_from_text(cleaned, display_title)
+        # 新标题明显比 display_title 长才采用，避免把标题回退成文件名
+        new_title = paper.get("title") or display_title
+        if new_title_candidate and len(new_title_candidate) > max(len(display_title), 8):
+            new_title = new_title_candidate
+
+        abstract = self._build_best_abstract(cleaned)
+        first_sentence = ""
+        try:
+            m = re.search(r"[^.!?。！？]+[.!?。！？]", cleaned)
+            first_sentence = m.group(0).strip() if m else cleaned[:100].strip() + "..."
+        except Exception:
+            first_sentence = cleaned[:100].strip() + "..."
+
+        declared_kws = extract_keywords_block(cleaned)
+        prev_kw_source = str(paper.get("_keywords_source") or "auto")
+        if declared_kws:
+            paper["keywords"] = declared_kws
+            paper["_keywords_source"] = "declared"
+        elif prev_kw_source != "declared":
+            # 原本就是自动推断的才刷新；用户若是 declared（论文自带）保留
+            try:
+                kws = self._auto_keywords(
+                    paper_id,
+                    top_k=8,
+                    title=new_title,
+                    abstract=abstract,
+                )
+                if not kws and new_title:
+                    kws = [new_title[:20]]
+                paper["keywords"] = kws
+                paper["_keywords_source"] = "auto"
+            except Exception as e:
+                print(f"[store] Warning: auto keywords refresh failed: {e}")
+
+        paper["title"] = new_title
+        paper["display_title"] = display_title
+        paper["abstract"] = abstract
+        paper["first_sentence"] = first_sentence
+        paper["_ocr_mode"] = (ocr_mode or "").lower().strip() or paper.get("_ocr_mode") or "auto"
+        paper["_parser"] = (parser or "").lower().strip() or paper.get("_parser") or "default"
+
+        # 向量库：先删旧，再建新
+        try:
+            vstore = self._ensure_vstore()
+            vstore.delete_paper(paper_id)
+        except Exception as e:
+            print(f"[store] Warning: failed to purge old vectors for {paper_id}: {e}")
+
+        # 关键词语料：先注销再注册，保证 TF-IDF 用最新文本
+        self._unregister_corpus(paper_id)
+        self._register_corpus(paper_id, cleaned)
+
+        try:
+            self._index_paper(paper, cleaned)
+        except Exception as e:
+            print(f"[store] Warning: reindex failed for {paper_id}: {e}")
+
+        with self._lock:
+            self._papers[idx] = paper
+            try:
+                if recompute_geometry:
+                    self._recompute_locked()
+                else:
+                    self._save_db()
+            except Exception as e:
+                print(f"[store] Warning: save after reprocess failed: {e}")
+
+        return {
+            "paper_id": paper_id,
+            "ocr_mode": paper["_ocr_mode"],
+            "parser": paper["_parser"],
+            "text_len": len(cleaned),
+            "abstract_len": len(abstract or ""),
+            "keywords": list(paper.get("keywords") or []),
+        }
+
+    def delete_paper(self, paper_id: str, delete_source_files: bool = True) -> bool:
         """
         删除指定论文（元数据 + PDF 文件 + 向量库记录），并重算可视化状态。
+        delete_source_files=True 时会额外删除 inbox/_processed 里的同名源文件，
+        彻底阻断“重启后从 inbox 回流”。
         返回是否成功删除到论文记录。
         """
         with self._lock:
             idx = next((i for i, p in enumerate(self._papers) if str(p.get("id") or "") == paper_id), -1)
             if idx < 0:
                 return False
-            self._papers.pop(idx)
+            paper = self._papers.pop(idx)
+            filename = str(paper.get("filename") or "").strip()
 
             # 删除向量库记录（失败不阻断）
             try:
                 self._ensure_vstore().delete_paper(paper_id)
             except Exception as e:
                 print(f"[store] Warning: failed to delete vectors for {paper_id}: {e}")
+
+            # 从全库关键词语料中移除
+            self._unregister_corpus(paper_id)
 
             # 删除 PDF 文件（失败不阻断）
             try:
@@ -523,6 +1135,15 @@ class ScholarStore:
                     pdf_path.unlink()
             except Exception as e:
                 print(f"[store] Warning: failed to delete pdf for {paper_id}: {e}")
+
+            # 可选：同步清理 inbox 里的同名源文件，避免重启时回流
+            if delete_source_files and filename:
+                for p in [INBOX_DIR / filename, INBOX_DIR / "_processed" / filename]:
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except Exception as e:
+                        print(f"[store] Warning: failed to delete source file {p}: {e}")
 
             try:
                 self._recompute_locked()
