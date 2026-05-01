@@ -60,6 +60,9 @@ def is_mineru_available() -> bool:
     """检查 MinerU CLI 能否调用（带 --help 探测一次）。"""
     cmd = _mineru_cmd()
     try:
+        # 如果给的是绝对路径，先快速检查文件是否存在
+        if ("\\" in cmd or "/" in cmd) and not Path(cmd).exists():
+            return False
         r = subprocess.run(
             [cmd, "--help"],
             stdout=subprocess.PIPE,
@@ -67,6 +70,14 @@ def is_mineru_available() -> bool:
             timeout=20,
             check=False,
         )
+        # 一些版本在 --help 时会输出帮助文本但返回非 0，这里做兼容：
+        # 只要能看到典型 usage 文本，就认为可用。
+        out = ((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode(
+            "utf-8",
+            errors="ignore",
+        ).lower()
+        if "usage: mineru" in out or "mineru [options]" in out:
+            return True
         return r.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False

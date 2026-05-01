@@ -9,13 +9,17 @@ interface Props {
   paper: Paper;
   llmProvider: string;
   onProviderChange: (id: string) => void;
+  onLocateSnippet?: (snippet: string, page?: number | null) => void;
 }
 
 type Msg = {
   role: 'user' | 'ai';
   text: string;
   imagePreview?: string; // dataURL 缩略图
+  citeDetails?: Array<{ paper_id: string; chunk_id?: string; snippet?: string; page?: number | null }>;
 };
+
+type CiteDetail = NonNullable<Msg['citeDetails']>[number];
 
 /**
  * 深度阅读侧边的轻量对话面板。
@@ -23,7 +27,81 @@ type Msg = {
  * - 独立于全局 chat：关闭阅读器即丢弃，避免和左侧主对话互相污染。
  * - 支持截图提问：按钮上传 / 粘贴板粘贴 → 调用 queryVision（需多模态模型）。
  */
-export default function ReaderChat({ paper, llmProvider, onProviderChange }: Props) {
+export default function ReaderChat({ paper, llmProvider, onProviderChange, onLocateSnippet }: Props) {
+  const normalizeAnswerText = (
+    raw: string,
+    details: Array<{ paper_id: string; chunk_id?: string; snippet?: string }> = [],
+  ) => {
+    const firstIndexByPaper = new Map<string, number>();
+    details.forEach((d, i) => {
+      if (!d?.paper_id || firstIndexByPaper.has(d.paper_id)) return;
+      firstIndexByPaper.set(d.paper_id, i + 1);
+    });
+    let t = raw || '';
+    t = t.replace(/\[CITE:([^\]]+)\]/gi, (_m, pid) => {
+      const idx = firstIndexByPaper.get(String(pid).trim());
+      return idx ? `[参考${idx}]` : '';
+    });
+    t = t.replace(/(?:\(|（)?\s*paper_id\s*=\s*([A-Za-z0-9_-]+)\s*(?:\)|）)?/gi, (_m, pid) => {
+      const idx = firstIndexByPaper.get(String(pid).trim());
+      return idx ? `[参考${idx}]` : '';
+    });
+    t = t.replace(/(?:\(|（)?\s*chunk_id\s*=\s*([A-Za-z0-9_-]+)\s*(?:\)|）)?/gi, '');
+    t = t.replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+    return t;
+  };
+  const citationTerms = (text: string) => {
+    const raw = (text || '').toLowerCase();
+    const zh = raw.match(/[\u4e00-\u9fa5]{3,}/g) || [];
+    const en = raw.match(/[a-z][a-z0-9_-]{4,}/g) || [];
+    const stop = new Set([
+      'this',
+      'that',
+      'with',
+      'from',
+      'have',
+      'about',
+      'which',
+      'there',
+      'their',
+      'paper',
+      'chunk',
+      'reference',
+      'according',
+      'based',
+    ]);
+    return Array.from(new Set([...zh, ...en].filter((x) => !stop.has(x)))).slice(0, 24);
+  };
+  const scoreCitationForBlock = (block: string, hit: CiteDetail) => {
+    const blockTerms = citationTerms(block);
+    const snippetTerms = new Set(citationTerms(hit.snippet || ''));
+    if (!blockTerms.length || !snippetTerms.size) return 0;
+    return blockTerms.reduce((score, term) => score + (snippetTerms.has(term) ? 1 : 0), 0);
+  };
+  const citationIndexesForBlock = (block: string, cards: CiteDetail[], fallbackIdx: number) => {
+    if (!cards.length) return [];
+    const ranked = cards
+      .map((hit, idx) => ({ idx, score: scoreCitationForBlock(block, hit) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map((x) => x.idx);
+    if (ranked.length) return ranked;
+    return [Math.min(fallbackIdx, cards.length - 1)];
+  };
+  const splitAnswerBlocks = (text: string) => {
+    const normalized = (text || '').trim();
+    if (!normalized) return [];
+    const paragraphBlocks = normalized
+      .split(/\n{2,}/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return paragraphBlocks.flatMap((block) => {
+      const lines = block.split('\n').map((s) => s.trim()).filter(Boolean);
+      const bulletLike = lines.length > 1 && lines.every((line) => /^(\s*[-*•]\s+|\s*\d+[.、]\s+|#{1,4}\s+)/.test(line) || line.length < 48);
+      return bulletLike ? lines : [block];
+    });
+  };
   const [msgs, setMsgs] = useState<Msg[]>([
     {
       role: 'ai',
@@ -40,6 +118,21 @@ export default function ReaderChat({ paper, llmProvider, onProviderChange }: Pro
   const [visionError, setVisionError] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const renderCitationChip = (hit: CiteDetail, idx: number, key: string) => {
+    const snippet = (hit?.snippet || '').trim();
+    return (
+      <button
+        key={key}
+        type="button"
+        onClick={() => onLocateSnippet?.(snippet, hit.page)}
+        className="inline-flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-500/35 bg-slate-700/35 px-1.5 text-[10px] text-slate-200 hover:bg-slate-600/50 transition-colors"
+        title={snippet || '点击定位到引用原文'}
+      >
+        <span className="font-mono">{idx + 1}</span>
+      </button>
+    );
+  };
 
   useEffect(() => {
     setMsgs([
@@ -123,7 +216,15 @@ export default function ReaderChat({ paper, llmProvider, onProviderChange }: Pro
           mode: anchored ? 'rag' : 'auto',
         });
         setAttachedImage(null);
-        setMsgs((prev) => [...prev, { role: 'ai', text: res.answer || 'AI 未返回内容' }]);
+        const citeDetails = (res.cite_details || []);
+        setMsgs((prev) => [
+          ...prev,
+          {
+            role: 'ai',
+            text: normalizeAnswerText(res.answer || 'AI 未返回内容', citeDetails),
+            citeDetails,
+          },
+        ]);
       } else {
         const backendMsg = anchored
           ? `【已选定以下文献作为重点参考】\n1. 《${paper.displayTitle || paper.title || paper.filename}》(paper_id=${paper.id})\n\n用户问题：\n${raw}`
@@ -131,7 +232,15 @@ export default function ReaderChat({ paper, llmProvider, onProviderChange }: Pro
         const recent = msgs.slice(-6).map((m) => ({ role: m.role, text: m.text }));
         const mode: AssistantMode = anchored ? 'rag' : 'auto';
         const res = await queryWithProvider(backendMsg, llmProvider, recent, mode);
-        setMsgs((prev) => [...prev, { role: 'ai', text: res.answer || 'AI 未返回内容' }]);
+        const citeDetails = (res.cite_details || []);
+        setMsgs((prev) => [
+          ...prev,
+          {
+            role: 'ai',
+            text: normalizeAnswerText(res.answer || 'AI 未返回内容', citeDetails),
+            citeDetails,
+          },
+        ]);
       }
     } catch (e: any) {
       console.error(e);
@@ -183,29 +292,81 @@ export default function ReaderChat({ paper, llmProvider, onProviderChange }: Pro
 
       {/* 消息列表 */}
       <div ref={listRef} className="flex-1 overflow-y-auto p-3 space-y-3 scrollbar-hide">
-        {msgs.map((m, i) => (
-          <div
-            key={i}
-            className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
-          >
+        {msgs.map((m, i) => {
+          const cards = (m.citeDetails || [])
+            .filter((d) => d.paper_id === paper.id && (d.snippet || '').trim())
+            .slice(0, 5);
+          const blocks = m.role === 'ai' ? splitAnswerBlocks(m.text) : [];
+
+          return (
             <div
-              className={`max-w-[92%] px-3 py-2 rounded-xl text-[12.5px] leading-relaxed break-words ${
-                m.role === 'user'
-                  ? 'bg-indigo-600 text-white whitespace-pre-wrap'
-                  : 'bg-white/5 border border-white/10'
-              }`}
+              key={i}
+              className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
             >
-              {m.imagePreview && (
-                <img
-                  src={m.imagePreview}
-                  alt="screenshot"
-                  className="rounded-md mb-1.5 max-h-40 border border-white/10"
-                />
-              )}
-              {m.role === 'user' ? m.text : <MarkdownMessage text={m.text} compact />}
+              <div
+                className={`max-w-[92%] px-3 py-2 rounded-xl text-[12.5px] leading-relaxed break-words ${
+                  m.role === 'user'
+                    ? 'bg-indigo-600 text-white whitespace-pre-wrap'
+                    : 'bg-white/5 border border-white/10'
+                }`}
+              >
+                {m.imagePreview && (
+                  <img
+                    src={m.imagePreview}
+                    alt="screenshot"
+                    className="rounded-md mb-1.5 max-h-40 border border-white/10"
+                  />
+                )}
+                {m.role === 'user' ? (
+                  m.text
+                ) : cards.length > 0 && blocks.length > 0 ? (
+                  <div className="space-y-2.5">
+                    {blocks.map((block, blockIdx) => {
+                      const refIndexes = citationIndexesForBlock(
+                        block,
+                        cards,
+                        blockIdx % Math.max(cards.length, 1),
+                      );
+                      return (
+                        <div key={`${i}-reader-block-${blockIdx}`} className="leading-relaxed">
+                          <MarkdownMessage text={block} compact />
+                          {refIndexes.length > 0 ? (
+                            <span className="mt-1 inline-flex items-center gap-1 align-middle">
+                              {refIndexes.map((refIdx) =>
+                                renderCitationChip(
+                                  cards[refIdx],
+                                  refIdx,
+                                  `${i}-reader-block-${blockIdx}-ref-${refIdx}`,
+                                ),
+                              )}
+                            </span>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <MarkdownMessage text={m.text} compact />
+                )}
+                {m.role === 'ai' && cards.length > 0 && (
+                  <div className="mt-3 pt-2 border-t border-white/10 flex flex-col gap-1.5">
+                    <div className="text-[10px] text-yellow-300/90">总来源（点击定位到 PDF）</div>
+                    {cards.map((d, idx) => (
+                      <button
+                        key={`${d.chunk_id || idx}`}
+                        className="text-left text-[10px] px-2 py-1 rounded border border-yellow-400/35 bg-yellow-300/10 hover:bg-yellow-300/20 text-yellow-100 line-clamp-2"
+                        title={d.snippet || ''}
+                        onClick={() => onLocateSnippet?.((d.snippet || '').trim(), d.page)}
+                      >
+                        [{idx + 1}] {d.page ? `(第${d.page}页) ` : ''}{(d.snippet || '').trim()}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {loading && (
           <div className="flex gap-1.5 p-2 bg-white/5 rounded-xl w-fit">
             <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce" />

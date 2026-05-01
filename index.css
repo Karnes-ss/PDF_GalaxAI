@@ -67,3 +67,22 @@ canvas {
 .markdown-body .katex-display > .katex {
   white-space: nowrap;
 }
+
+/* ReaderModal 内 PDF 文本层高亮（react-pdf） */
+.pdf-hit {
+  color: transparent;
+  border-radius: 3px;
+  padding: 0 1px;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.pdf-hit-primary {
+  background: rgba(250, 204, 21, 0.42);
+  border-bottom: 2px solid rgba(217, 119, 6, 0.85);
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.35);
+}
+
+.pdf-hit-secondary {
+  background: rgba(250, 204, 21, 0.22);
+  border-bottom: 1px solid rgba(245, 158, 11, 0.55);
+}

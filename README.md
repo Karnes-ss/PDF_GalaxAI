@@ -402,6 +402,10 @@ sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng
 
 - 可以在面板顶部切换模型（和主对话一致）
 - **锁定本篇**：开启后会优先基于当前论文回答（适合细读该论文）
+- 回答中若命中证据，会在段落/要点后出现小型引用标签（可点击跳转）
+- 回答底部保留“总来源”汇总区，用于统一查看并跳转到对应 PDF 页/片段
+
+> 如果你看不到段尾引用标签，先确认提问模式不是 `chat`（通用对话不走文献检索），并确认该回答确实有 `cite_details`。
 
 ### 9.2 截图提问（Vision → 描述 → RAG → 回答）
 
@@ -434,6 +438,7 @@ sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng
 | 截图发送后报错「不支持看图」 | 当前选的是纯文本模型 | 切换到 **Gemini / GPT-4o** 等多模态模型 |
 | MinerU 菜单显示「未安装」 | 系统找不到 `mineru` 或 `SCHOLAR_MINERU_CMD` 填错 | 按第 12 节安装并配置路径，重启后端 |
 | MinerU 很慢或超时 | CPU 解析大 PDF | 只对关键论文使用；或增大 `SCHOLAR_MINERU_TIMEOUT` |
+| 阅读器提示 `PDF.js` API/Worker 版本不一致 | `pdfjs-dist` 被安装成多个版本 | 执行 `npm ls react-pdf pdfjs-dist` 检查版本；统一为同一版本后重启前端 |
 | Gemini 连不上 / 超时 | 网络、代理、地区限制 | 检查 VPN；在模型配置里试 **直连 / 系统代理 / 自定义代理** |
 | 自定义 OpenAI 兼容模型 401/403 | Key 或 base_url 错误 | 在「模型管理」里核对；用「测试连接」验证 |
 | DeepSeek 返回 402 | 账户余额不足 | 在 DeepSeek 控制台充值或换模型名 |
@@ -535,9 +540,25 @@ which mineru
 
 ### 12.3 在 UI 里如何使用？
 
-打开某篇论文详情 → `重新识别` → 选择 `MinerU（公式/表格最优）`。
+打开某篇论文详情 → `重新识别`：
+
+- `自动 OCR`：按页判断是否需要 OCR（推荐默认）
+- `强制 OCR`：全部页面 OCR（最稳但更慢）
+- `关闭 OCR`：只用 PDF 原生文本层
+- 解析器可选 `默认` / `MinerU（公式/表格最优）`
+
+你可以只对单篇论文执行，不会影响全局设置。
+
+如需确认后端是否识别到 MinerU，可检查：
+
+- `GET /api/mineru/status`
 
 性能提示：
 
 - 有 NVIDIA CUDA：通常每页 1~3 秒
 - 只有 CPU：可能 20~60 秒/页（建议只对关键论文使用）
+
+补充说明（兼容性）：
+
+- 部分 MinerU 版本 `mineru --help` 的输出格式不同；当前后端已兼容常见 `usage` 文本检测。
+- 项目启动会自动读取 `backend/.env`，`SCHOLAR_MINERU_CMD` 无需再额外手工导出到系统环境变量。
