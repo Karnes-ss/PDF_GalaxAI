@@ -4,6 +4,41 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _load_local_env_file() -> None:
+    """
+    轻量读取 backend/.env（不依赖 python-dotenv）。
+    规则：
+    - 支持 KEY=VALUE
+    - 跳过空行与 # 注释
+    - 仅在当前进程里该变量不存在时才写入（不覆盖系统环境变量）
+    - 支持去掉首尾引号 "..." / '...'
+    """
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if not key:
+                continue
+            if (val.startswith('"') and val.endswith('"')) or (
+                val.startswith("'") and val.endswith("'")
+            ):
+                val = val[1:-1]
+            os.environ.setdefault(key, val)
+    except Exception as e:
+        print(f"[config] Warning: failed to load .env: {e}")
+
+
+_load_local_env_file()
+
 DATA_DIR = Path(os.getenv("SCHOLAR_DATA_DIR") or (ROOT / "data")).resolve()
 FILES_DIR = DATA_DIR / "files"
 PAPERS_JSON = DATA_DIR / "papers.json"

@@ -13,6 +13,66 @@ const LLM_PROVIDER_STORAGE_KEY = 'scholar:llm-provider';
 const ASSISTANT_MODE_STORAGE_KEY = 'scholar:assistant-mode';
 
 export function App() {
+  type CiteDetail = { paper_id: string; chunk_id?: string; snippet?: string; page?: number | null };
+  type ChatMsg = { role: string; text: string; cites?: string[]; citeDetails?: CiteDetail[] };
+  const normalizeAnswerText = (raw: string, details: CiteDetail[] = []) => {
+    const firstIndexByPaper = new Map<string, number>();
+    details.forEach((d, i) => {
+      if (!d?.paper_id || firstIndexByPaper.has(d.paper_id)) return;
+      firstIndexByPaper.set(d.paper_id, i + 1);
+    });
+    let t = raw || '';
+    t = t.replace(/\[CITE:([^\]]+)\]/gi, (_m, pid) => {
+      const idx = firstIndexByPaper.get(String(pid).trim());
+      return idx ? `[参考${idx}]` : '';
+    });
+    t = t.replace(/(?:\(|（)?\s*paper_id\s*=\s*([A-Za-z0-9_-]+)\s*(?:\)|）)?/gi, (_m, pid) => {
+      const idx = firstIndexByPaper.get(String(pid).trim());
+      return idx ? `[参考${idx}]` : '';
+    });
+    t = t.replace(/(?:\(|（)?\s*chunk_id\s*=\s*([A-Za-z0-9_-]+)\s*(?:\)|）)?/gi, '');
+    t = t.replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+    return t;
+  };
+  const citationTerms = (text: string) => {
+    const raw = (text || '').toLowerCase();
+    const zh = raw.match(/[\u4e00-\u9fa5]{3,}/g) || [];
+    const en = raw.match(/[a-z][a-z0-9_-]{4,}/g) || [];
+    const stop = new Set([
+      'this',
+      'that',
+      'with',
+      'from',
+      'have',
+      'about',
+      'which',
+      'there',
+      'their',
+      'paper',
+      'chunk',
+      'reference',
+      'according',
+      'based',
+    ]);
+    return Array.from(new Set([...zh, ...en].filter((x) => !stop.has(x)))).slice(0, 24);
+  };
+  const scoreCitationForBlock = (block: string, hit: CiteDetail) => {
+    const blockTerms = citationTerms(block);
+    const snippetTerms = new Set(citationTerms(hit.snippet || ''));
+    if (!blockTerms.length || !snippetTerms.size) return 0;
+    return blockTerms.reduce((score, term) => score + (snippetTerms.has(term) ? 1 : 0), 0);
+  };
+  const citationIndexesForBlock = (block: string, cards: CiteDetail[], fallbackIdx: number) => {
+    if (!cards.length) return [];
+    const ranked = cards
+      .map((hit, idx) => ({ idx, score: scoreCitationForBlock(block, hit) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map((x) => x.idx);
+    if (ranked.length) return ranked;
+    return [Math.min(fallbackIdx, cards.length - 1)];
+  };
   const [papers, setPapers] = useState<Paper[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
@@ -20,7 +80,7 @@ export function App() {
   const [searchText, setSearchText] = useState('');
   const [highlightedSearchPaperId, setHighlightedSearchPaperId] = useState<string | null>(null);
   const [selectedPaperScreenPosition, setSelectedPaperScreenPosition] = useState<{ x: number; y: number } | null>(null);
-  const [chat, setChat] = useState<{ role: string; text: string; cites?: string[] }[]>([
+  const [chat, setChat] = useState<ChatMsg[]>([
     { role: 'ai', text: '欢迎进入本地 Scholar 星系。请上传 PDF 文献以生成你的专属知识星云。' },
   ]);
   const [input, setInput] = useState('');
@@ -61,6 +121,8 @@ export function App() {
   const [activeHighlights, setActiveHighlights] = useState<string[]>([]);
   // 对话框附加的文献（右键节点 / 点击「加入对话」加进来）
   const [attachedPapers, setAttachedPapers] = useState<Paper[]>([]);
+  const [readerHighlightText, setReaderHighlightText] = useState<string>('');
+  const [readerHighlightPage, setReaderHighlightPage] = useState<number | null>(null);
 
   const handleAddPaperToChat = (p: Paper) => {
     setAttachedPapers((prev) => {
@@ -206,7 +268,9 @@ export function App() {
       const effectiveMode = attachedSnapshot.length ? 'rag' : assistantMode;
       const res = await queryWithProvider(backendMsg, llmProvider, recent, effectiveMode);
       
-      const answer = res.answer || 'AI 未返回内容';
+      const citeDetails = (res.cite_details || []) as CiteDetail[];
+      const answerRaw = res.answer || 'AI 未返回内容';
+      const answer = normalizeAnswerText(answerRaw, citeDetails);
       // 兼容两种引用格式：后端返回的 cites 数组 或 文本中的 [CITE:id] 标记
       const cites = (
         res.cites?.map((c) => (typeof c === 'string' ? c : c?.paper_id || '')) ||
@@ -225,7 +289,15 @@ export function App() {
           : pu
           ? `（${pu}）`
           : '';
-      setChat((prev) => [...prev, { role: 'ai', text: `${answer}\n\n${providerTag}`, cites }]);
+      setChat((prev) => [
+        ...prev,
+        {
+          role: 'ai',
+          text: `${answer}\n\n${providerTag}`,
+          cites,
+          citeDetails,
+        },
+      ]);
       setActiveHighlights(cites);
     } catch (err) {
       console.error(err);
@@ -346,6 +418,25 @@ export function App() {
     }
   };
 
+  const openCitation = (hit: CiteDetail) => {
+    const cid = hit.paper_id;
+    const citedPaper = papers.find((x) => x.id === cid) || null;
+    setSelectedPaper(citedPaper);
+    setHighlightedSearchPaperId(null);
+    setActiveHighlights([cid]);
+    if (citedPaper) {
+      setSelectedPaperScreenPosition({
+        x: Math.max(120, window.innerWidth * 0.42),
+        y: Math.max(90, window.innerHeight * 0.25),
+      });
+      setReaderHighlightText((hit?.snippet || '').trim());
+      setReaderHighlightPage((hit?.page && hit.page > 0) ? hit.page : null);
+      setReaderPaper(citedPaper);
+    } else {
+      setSelectedPaperScreenPosition(null);
+    }
+  };
+
   return (
     <div className="flex h-screen w-full bg-[#020617] text-white overflow-hidden font-sans">
       {/* 左侧功能栏 */}
@@ -416,7 +507,11 @@ export function App() {
             setSelectedPaper(null);
             setSelectedPaperScreenPosition(null);
           }}
-          onOpenReader={(p) => setReaderPaper(p)}
+          onOpenReader={(p) => {
+            setReaderHighlightText('');
+            setReaderHighlightPage(null);
+            setReaderPaper(p);
+          }}
           onDelete={handleDeleteSelectedPaper}
           onAddToChat={handleAddPaperToChat}
           onReprocessed={async (paperId) => {
@@ -450,9 +545,15 @@ export function App() {
       {readerPaper && (
         <ReaderModal
           readerPaper={readerPaper}
-          onClose={() => setReaderPaper(null)}
+          onClose={() => {
+            setReaderPaper(null);
+            setReaderHighlightText('');
+            setReaderHighlightPage(null);
+          }}
           llmProvider={llmProvider}
           onProviderChange={setLlmProvider}
+          initialHighlightText={readerHighlightText}
+          initialHighlightPage={readerHighlightPage}
         />
       )}
 
@@ -510,7 +611,20 @@ export function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-hide">
-          {chat.map((m, i) => (
+          {chat.map((m, i) => {
+            const details = (m.citeDetails || []).filter((d) => !!d?.paper_id);
+            const cards = details.length
+              ? details.slice(0, 6)
+              : (m.cites || []).slice(0, 6).map((pid) => ({ paper_id: pid } as CiteDetail));
+            const sourceSectionId = `chat-source-${i}`;
+            const aiBlocks = m.role === 'ai'
+              ? (m.text || '')
+                  .split(/\n{2,}/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : [];
+
+            return (
             <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div
                 className={`max-w-[90%] p-4 rounded-2xl text-sm leading-relaxed break-words ${
@@ -520,47 +634,100 @@ export function App() {
                 {m.role === 'user' ? (
                   m.text
                 ) : (
-                  <MarkdownMessage text={m.text} />
+                  (m.cites && m.cites.length > 0 && aiBlocks.length > 0) ? (
+                    <div className="space-y-3">
+                      {aiBlocks.map((block, blockIdx) => {
+                        const refIndexes = citationIndexesForBlock(block, cards, blockIdx % Math.max(cards.length, 1));
+                        return (
+                          <div key={`${i}-block-${blockIdx}`} className="leading-relaxed">
+                            <MarkdownMessage text={block} />
+                            {refIndexes.length > 0 ? (
+                              <span className="mt-1 inline-flex items-center gap-1">
+                                {refIndexes.map((refIdx) => {
+                                  const hit = cards[refIdx];
+                                  const snippet = (hit?.snippet || '').trim();
+                                  return (
+                                    <button
+                                      key={`${i}-block-${blockIdx}-ref-${refIdx}`}
+                                      type="button"
+                                      onClick={() => openCitation(hit)}
+                                      className="inline-flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-500/35 bg-slate-700/35 px-1.5 text-[10px] text-slate-200 hover:bg-slate-600/50 transition-colors"
+                                      title={snippet || '点击定位到引用原文'}
+                                    >
+                                      <span className="font-mono">{refIdx + 1}</span>
+                                    </button>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const el = document.getElementById(sourceSectionId);
+                                    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                                  }}
+                                  className="text-[10px] text-slate-500 hover:text-slate-300"
+                                  title="查看总来源"
+                                >
+                                  ...
+                                </button>
+                              </span>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <MarkdownMessage text={m.text} />
+                  )
                 )}
-                {m.cites && m.cites.length > 0 && (
-                  <div className="mt-4 pt-3 border-t border-white/10 flex flex-wrap gap-2">
-                    {m.cites.map((cid) => {
-                      const citedPaper = papers.find((x) => x.id === cid) || null;
-                      const citeColor = citedPaper?.color || '#22d3ee';
+                {(m.cites && m.cites.length > 0) && (
+                  <div id={sourceSectionId} className="mt-4 pt-3 border-t border-white/10">
+                    <div className="text-[11px] text-slate-400 mb-2">总来源（点击跳转到原文）</div>
+                    <div className="flex flex-col gap-2">
+                      {cards.map((hit, idx) => {
+                          const cid = hit.paper_id;
+                          const citedPaper = papers.find((x) => x.id === cid) || null;
+                          const citeColor = citedPaper?.color || '#22d3ee';
+                          const title =
+                            citedPaper?.displayTitle
+                            || citedPaper?.title
+                            || citedPaper?.filename
+                            || `已删除文献 (${cid.slice(0, 8)})`;
+                          const snippet = (hit?.snippet || '').trim();
+                          const pageText = hit?.page && hit.page > 0 ? `第 ${hit.page} 页` : '';
 
-                      return (
-                        <button
-                          key={cid}
-                          onClick={() => {
-                            setSelectedPaper(citedPaper);
-                            setHighlightedSearchPaperId(null);
-                            setActiveHighlights([cid]);
-                            if (citedPaper) {
-                              setSelectedPaperScreenPosition({
-                                x: Math.max(120, window.innerWidth * 0.42),
-                                y: Math.max(90, window.innerHeight * 0.25),
-                              });
-                            } else {
-                              setSelectedPaperScreenPosition(null);
-                            }
-                          }}
-                          className="text-[10px] px-2 py-0.5 rounded border transition-all hover:brightness-110"
-                          style={{
-                            color: citeColor,
-                            borderColor: `${citeColor}66`,
-                            backgroundColor: `${citeColor}1A`,
-                            boxShadow: `0 0 10px ${citeColor}33`,
-                          }}
-                        >
-                          证据文献 #{cid.slice(0, 8)}
-                        </button>
-                      );
-                    })}
+                          return (
+                            <button
+                              key={`${cid}-${hit.chunk_id || idx}`}
+                              onClick={() => openCitation(hit)}
+                              className="text-left text-[11px] p-2 rounded-lg border transition-all hover:brightness-110"
+                              style={{
+                                color: citeColor,
+                                borderColor: `${citeColor}66`,
+                                backgroundColor: `${citeColor}14`,
+                                boxShadow: `0 0 8px ${citeColor}22`,
+                              }}
+                              title={snippet ? `点击跳转：${snippet}` : '点击跳转到文献'}
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono opacity-90">[{idx + 1}]</span>
+                                <span className="truncate font-semibold">📄 {title}</span>
+                                {pageText ? <span className="text-[10px] opacity-70 shrink-0">{pageText}</span> : null}
+                              </div>
+                              {snippet ? (
+                                <div className="mt-1 text-[10px] opacity-85 line-clamp-2">
+                                  {snippet}
+                                </div>
+                              ) : null}
+                            </button>
+                          );
+                        })}
+                    </div>
                   </div>
                 )}
               </div>
             </div>
-          ))}
+            );
+          })}
           {loading && (
             <div className="flex gap-2 p-4 bg-white/5 rounded-2xl w-fit animate-pulse">
               <div className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" />

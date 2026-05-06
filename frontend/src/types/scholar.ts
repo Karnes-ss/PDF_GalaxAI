@@ -31,7 +31,7 @@ export type GraphResponse = {
 export type QueryResponse = {
   answer: string;
   cites: Array<string | { paper_id?: string; chunk_id?: string; snippet?: string }>;
-  cite_details?: Array<{ paper_id: string; chunk_id?: string; snippet?: string }>;
+  cite_details?: Array<{ paper_id: string; chunk_id?: string; snippet?: string; page?: number | null }>;
   provider_used?: string;  // 'local' | 'gemini' | 'system' | 自定义模型 id
   mode?: 'rag' | 'rag_soft' | 'chat';
   status?: string;

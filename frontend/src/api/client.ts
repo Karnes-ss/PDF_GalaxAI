@@ -102,7 +102,7 @@ export type VisionQueryResponse = {
   answer: string;
   description: string;
   cites: string[];
-  cite_details: { paper_id: string; chunk_id: string; snippet: string }[];
+  cite_details: { paper_id: string; chunk_id: string; snippet: string; page?: number | null }[];
   provider_used: string;
   status: string;
 };

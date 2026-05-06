@@ -912,6 +912,66 @@ class ScholarStore:
         except Exception:
             return 0
 
+    @staticmethod
+    def _norm_match_text(text: str) -> str:
+        s = clean_text(text or "").lower()
+        # 仅保留中英文与数字，去掉空白/标点，便于跨行、断词匹配
+        s = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", s)
+        return s
+
+    def locate_snippet_page(self, paper_id: str, snippet: str) -> int | None:
+        """
+        粗定位 snippet 所在页（1-based）。
+        优先做规范化后的子串命中；命中不到返回 None。
+        """
+        pdf_path = FILES_DIR / f"{paper_id}.pdf"
+        if not pdf_path.exists():
+            return None
+        target = self._norm_match_text(snippet)
+        if len(target) < 12:
+            return None
+        # 过长片段只取前中后三段做匹配，降低误差与开销
+        probes = [target]
+        if len(target) > 80:
+            probes = [
+                target[:60],
+                target[max(0, len(target) // 2 - 30): max(0, len(target) // 2 + 30)],
+                target[-60:],
+            ]
+        try:
+            pages = read_pdf_pages(pdf_path)
+        except Exception:
+            return None
+        for i, page_text in enumerate(pages, 1):
+            pn = self._norm_match_text(page_text)
+            if not pn:
+                continue
+            hit_count = sum(1 for p in probes if p and p in pn)
+            if hit_count >= max(1, len(probes) // 2):
+                return i
+
+        # 二级兜底：按关键词命中数打分，返回最可能页
+        raw = clean_text(snippet or "")
+        zh_terms = re.findall(r"[\u4e00-\u9fff]{3,}", raw)
+        en_terms = re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", raw)
+        terms = [*zh_terms, *en_terms]
+        # 去噪、去重、长度优先
+        terms = [t.lower() for t in terms if t.lower() not in {"paper_id", "chunk_id"}]
+        terms = sorted(list(dict.fromkeys(terms)), key=len, reverse=True)[:10]
+        if not terms:
+            return None
+        best_page, best_score = None, 0
+        for i, page_text in enumerate(pages, 1):
+            pt = clean_text(page_text or "").lower()
+            if not pt:
+                continue
+            score = sum(1 for t in terms if t in pt)
+            if score > best_score:
+                best_score = score
+                best_page = i
+        # 至少命中 2 个关键词才认定，避免误跳
+        return best_page if best_score >= 2 else None
+
     def set_llm_summary(self, paper_id: str, summary: str) -> bool:
         """写入 / 清空某篇论文的 LLM 润色摘要。返回是否命中论文。"""
         with self._lock:

@@ -1073,7 +1073,7 @@ def create_app(store) -> FastAPI:
                 "你是一位博学、乐于助人的学术助手。用户有自己的文献库，"
                 "接下来的消息里可能附带检索到的相关段落。\n"
                 "回答原则：\n"
-                "1) 有相关段落时，基于段落回答，并在关键论点末尾用 (paper_id=XXX) 的形式标注来源；\n"
+                "1) 有相关段落时，基于段落回答，但不要在正文输出任何 paper_id / chunk_id 等技术字段；\n"
                 "2) 段落不够完整时，可以自然地用你自己的通用知识补充，但要说清哪些是来自文献、哪些是补充；\n"
                 "3) 语气自然、直接、一段话式，不要机械地说『根据参考资料…』；\n"
                 "4) 如果段落与问题无关，坦率说'文献里没直接写到这个'，然后再给出一般性回答。"
@@ -1082,7 +1082,7 @@ def create_app(store) -> FastAPI:
             system_prompt = (
                 "你是一位博学、乐于助人的学术助手。用户的文献库里可能和问题相关度一般，"
                 "下方附带的片段仅供参考。请自然地回答，可以用你自己的知识补充，"
-                "若引用了片段请在末尾用 (paper_id=XXX) 注明。"
+                "若引用了片段请自然说明来源，但不要输出任何 paper_id / chunk_id 技术字段。"
             )
         else:
             system_prompt = (
@@ -1103,6 +1103,7 @@ def create_app(store) -> FastAPI:
             "\n- 数学公式一律用 LaTeX：行内用 $...$，独立成行用 $$...$$。"
             "\n- 不要输出孤立的反斜杠、星号或乱码字符；若原文里有 OCR 残留符号，请自行整理成人类可读的形式。"
             "\n- 不要对公式字符做任何转义（不要写 \\_、\\*），直接给合法的 LaTeX。"
+            "\n- 不要在最终回答中出现 `paper_id=`、`chunk_id=`、`[CITE:...]` 等内部标识。"
             "\n- 所有回答用简体中文。"
         )
 
@@ -1151,14 +1152,19 @@ def create_app(store) -> FastAPI:
                 cite_details: list[dict[str, Any]] = []
                 cites: list[str] = []
             else:
-                cite_details = [
-                    {
-                        "paper_id": c["paper_id"],
-                        "chunk_id": c["chunk_id"],
-                        "snippet": c["snippet"],
-                    }
-                    for c in (high_quality_chunks or chunks)
-                ]
+                cite_details = []
+                for c in (high_quality_chunks or chunks):
+                    pid = c["paper_id"]
+                    snip = c["snippet"]
+                    page_no = store.locate_snippet_page(pid, snip)
+                    cite_details.append(
+                        {
+                            "paper_id": pid,
+                            "chunk_id": c["chunk_id"],
+                            "snippet": snip,
+                            "page": page_no,
+                        }
+                    )
                 cites = list(dict.fromkeys([c["paper_id"] for c in cite_details]))
 
             return {
@@ -1341,14 +1347,19 @@ def create_app(store) -> FastAPI:
             print(f"[vision] final call failed: {type(e).__name__}: {e}")
             raise HTTPException(status_code=503, detail=f"LLM 回答失败：{e}")
 
-        cite_details = [
-            {
-                "paper_id": c["paper_id"],
-                "chunk_id": c["chunk_id"],
-                "snippet": c["snippet"],
-            }
-            for c in chunks
-        ]
+        cite_details = []
+        for c in chunks:
+            pid = c["paper_id"]
+            snip = c["snippet"]
+            page_no = store.locate_snippet_page(pid, snip)
+            cite_details.append(
+                {
+                    "paper_id": pid,
+                    "chunk_id": c["chunk_id"],
+                    "snippet": snip,
+                    "page": page_no,
+                }
+            )
         cites = list(dict.fromkeys([c["paper_id"] for c in cite_details]))
 
         return {
