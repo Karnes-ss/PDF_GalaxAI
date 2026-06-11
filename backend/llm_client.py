@@ -24,6 +24,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 
 # ---------------------------------------------------------------- #
@@ -143,6 +145,40 @@ def _openai_translate_messages(
     return out
 
 
+def _to_lc_messages(
+    messages: list[dict[str, Any]],
+    vision: bool,
+) -> list[BaseMessage]:
+    """将内部统一格式转换为 LangChain BaseMessage 列表。"""
+    translated = _openai_translate_messages(messages, vision=vision)
+    out: list[BaseMessage] = []
+    for m in translated:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            out.append(SystemMessage(content=content))
+        elif role == "assistant":
+            out.append(AIMessage(content=content))
+        else:
+            out.append(HumanMessage(content=content))
+    return out
+
+
+def _lc_content_to_text(content: Any) -> str:
+    """把 LangChain 响应的 content（可能是 str 或分段列表）展平成纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        buf: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                buf.append(str(p.get("text") or ""))
+            else:
+                buf.append(str(p))
+        return "".join(buf)
+    return str(content or "")
+
+
 async def _call_openai_compatible(
     cfg: dict[str, Any],
     messages: list[dict[str, Any]],
@@ -151,49 +187,31 @@ async def _call_openai_compatible(
     base_url = str(cfg.get("base_url") or "").rstrip("/")
     if not base_url:
         raise RuntimeError("模型配置缺少 base_url")
-    url = base_url + "/chat/completions"
     model = str(cfg.get("model") or "")
     if not model:
         raise RuntimeError("模型配置缺少 model")
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    api_key = str(cfg.get("api_key") or "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    # ChatOpenAI 强制要求非空 api_key；本地服务（Ollama/LMStudio）会忽略它。
+    api_key = str(cfg.get("api_key") or "").strip() or "no-key"
 
-    translated = _openai_translate_messages(messages, vision=_is_vision_capable(cfg))
+    lc_messages = _to_lc_messages(messages, vision=_is_vision_capable(cfg))
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": translated,
-        "temperature": temperature,
-    }
+    # 复用既有代理逻辑：把配好代理的 httpx 客户端注入 ChatOpenAI。
+    http_client = _build_client(cfg)
+    try:
+        llm = ChatOpenAI(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=temperature,
+            max_retries=2,
+            http_async_client=http_client,
+        )
+        resp = await llm.ainvoke(lc_messages)
+    finally:
+        await http_client.aclose()
 
-    answer = ""
-    async with _build_client(cfg) as client:
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            try:
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code == 502 and attempt == 0:
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                answer = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    or ""
-                ).strip()
-                if answer:
-                    break
-            except Exception as e:
-                last_exc = e
-                if attempt == 0:
-                    continue
-                raise
-        if not answer and last_exc:
-            raise last_exc
+    answer = _lc_content_to_text(resp.content).strip()
     if not answer:
         raise RuntimeError("LLM 返回空内容")
     return answer

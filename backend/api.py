@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sklearn.metrics.pairwise import cosine_similarity
 
+from agent import build_agent, should_use_agent
 from clustering import fallback_pos
 from config import FILES_DIR
 from llm_client import call_llm, encode_image_to_base64, is_vision_capable, test_connection
@@ -1187,6 +1188,80 @@ def create_app(store) -> FastAPI:
                 "status": "llm_error",
                 "message": _STATUS_MSG["llm_error"],
             }
+
+    # ---------------------------------------------------------------- #
+    # /api/agent-query — ReAct 多步 Agent（跨文献对比/综合类问题）
+    # ---------------------------------------------------------------- #
+
+    class AgentBody(BaseModel):
+        question: str
+        provider: str | None = None
+        history: list[ChatTurn] | None = None
+        # force=True 跳过启发式检测，直接走 agent
+        force: bool = False
+
+    @app.post("/api/agent-query")
+    async def api_agent_query(body: AgentBody) -> dict[str, Any]:
+        """
+        ReAct Agent 端点。
+        - 自动检测跨文献/对比类问题时路由到此；也可前端显式调用。
+        - 返回与 /api/query 相同结构，额外附带 steps 字段供调试。
+        """
+        question = (body.question or "").strip()
+        if not question:
+            return {"answer": "请输入问题。", "cites": [], "steps": [], "status": "ok", "message": ""}
+
+        if not body.force and not should_use_agent(question):
+            return {
+                "answer": "该问题适合普通 RAG，请使用 /api/query 接口。",
+                "cites": [],
+                "steps": [],
+                "status": "ok",
+                "message": "",
+            }
+
+        provider, cfg = _resolve_provider(body.provider)
+
+        # 把历史转成 messages 格式（role: user/assistant）
+        history_msgs: list[dict[str, str]] = []
+        for turn in (body.history or [])[-6:]:
+            role = (turn.role or "").lower()
+            text = (turn.text or "").strip()
+            if not text:
+                continue
+            if role in ("ai", "assistant", "model"):
+                history_msgs.append({"role": "assistant", "content": text})
+            elif role in ("user", "human"):
+                history_msgs.append({"role": "user", "content": text})
+
+        async def llm_fn(messages: list[dict], temperature: float = 0.3) -> str:
+            return await call_llm(cfg, messages, temperature=temperature)
+
+        agent = build_agent(store, llm_fn)
+
+        try:
+            result = await agent.run(question, history=history_msgs)
+        except Exception as e:
+            print(f"[api] agent error: {type(e).__name__}: {e}")
+            return {
+                "answer": f"Agent 执行失败：{e}",
+                "cites": [],
+                "steps": [],
+                "provider_used": provider,
+                "status": "llm_error",
+                "message": _STATUS_MSG["llm_error"],
+            }
+
+        return {
+            "answer": result["answer"],
+            "cites": [],
+            "cite_details": [],
+            "steps": result.get("steps", []),
+            "provider_used": provider,
+            "mode": "agent",
+            "status": "ok",
+            "message": "",
+        }
 
     # ---------------------------------------------------------------- #
     # 截图提问（多模态 RAG）

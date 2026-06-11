@@ -9,6 +9,91 @@
 
 本 README 同时作为**用户手册**，包含安装、启动、核心功能使用方式与排错指南。
 
+> 想了解技术实现/架构？见下方 [**技术架构总览（开发者向）**](#技术架构总览开发者向)；想直接上手用？跳到 [第 1 节](#1-环境要求)。
+
+---
+
+## 技术架构总览（开发者向）
+
+### 功能亮点
+
+- **多级解析兜底**：PyMuPDF 主力 → pdfplumber 降级 → OCR（按页面质量自动触发）→ MinerU（公式/表格密集论文，subprocess 隔离），覆盖原生 PDF、扫描件、理科公式三类真实场景。
+- **RAG 问答 + 自适应路由**：检索后做重排（语义 + 词面 + 质量加权），再按检索质量自动切换 `rag` / `rag_soft` / `chat` 三种回答模式，抑制答非所问与幻觉。
+- **跨文献 ReAct Agent**：对"对比/综合多篇论文"类问题，自动走手写的 Thought→Action→Observation 多步推理，调用文献库工具后汇总。
+- **3D 语义星系图**：论文向量经 KMeans 聚类 + UMAP 降至 3 维，用 Three.js + InstancedMesh 渲染为可交互图谱。
+- **多模态截图问答**：截图 + 文字 → 视觉描述 → RAG 检索 → 图文结合作答。
+- **多模型兼容**：本地 Ollama、云端 Gemini、任意 OpenAI 兼容接口（GPT / DeepSeek / Kimi / 智谱等），含直连/代理网络控制。
+
+### 数据流
+
+```
+PDF 上传
+   │
+   ▼
+[解析层]  fitz → pdfplumber(降级) → OCR(按质量) → MinerU(可选)  ──► text_processing 清洗
+   │
+   ▼
+[切分层]  chunker：RecursiveCharacterTextSplitter（自研滑窗兜底，size=500/overlap=100）
+   │
+   ▼
+[向量层]  sentence-transformers / bge-m3（1024 维，L2 归一化）
+   │
+   ├──► scholar_papers（论文级向量）──► KMeans 聚类 + UMAP 降 3D ──► Three.js 星系图
+   │
+   └──► scholar_chunks（chunk 级向量，持久化于 Chroma）
+                 │
+   用户提问 ─────┤
+                 ▼
+            检索 + 重排 ──► 自适应路由(rag/rag_soft/chat) ──► LLM 生成 ──► 答案 + 引用溯源
+                 │
+                 └─（跨文献/对比类）──► ReAct Agent 多步工具调用 ──► 汇总答案
+```
+
+### 技术栈
+
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | React + TypeScript, Vite, TailwindCSS, Three.js（OrbitControls / InstancedMesh） |
+| 后端 | FastAPI, Uvicorn, Pydantic |
+| 解析 | PyMuPDF (fitz), pdfplumber, pytesseract + Pillow, MinerU (subprocess) |
+| 切分 | langchain-text-splitters（RecursiveCharacterTextSplitter）+ 自研滑窗兜底 |
+| 向量 | sentence-transformers / BAAI/bge-m3（早期 MiniLM-384，升级为 bge-m3-1024） |
+| 存储 | ChromaDB（cosine，本地持久化，双 collection） |
+| 降维聚类 | UMAP (umap-learn), KMeans (scikit-learn), NumPy |
+| LLM | LangChain ChatOpenAI（OpenAI 兼容路径）+ Gemini（自研 httpx），本地 Ollama |
+
+### 后端模块职责
+
+| 文件 | 职责 |
+| --- | --- |
+| `main.py` / `server.py` | 启动入口 |
+| `api.py` | FastAPI 路由层（上传/检索/问答/Agent/可视化等端点） |
+| `store.py` | 核心编排：embedding、增删改、KMeans 聚类、检索调度 |
+| `vector_store.py` | Chroma 双 collection（`scholar_papers` / `scholar_chunks`）封装 |
+| `chunker.py` | 文本切分（langchain splitter + 自研滑窗兜底） |
+| `llm_client.py` | 统一 LLM 调用层（ChatOpenAI / Gemini，含代理控制与多模态） |
+| `agent.py` | ReAct Agent（多步工具调用） |
+| `clustering.py` | UMAP 降维与坐标兜底 |
+| `mineru_parser.py` | MinerU 解析封装 |
+| `keyword_extractor.py` | TF-IDF + jieba + MMR 关键词抽取 |
+| `summarizer.py` / `text_processing.py` | 摘要抽取 / 文本清洗 |
+| `models_registry.py` | 多模型注册表（内置 + 自定义 CRUD） |
+
+### 主要 API 端点
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/health` | 健康检查 |
+| POST | `/api/upload` | 上传 PDF |
+| POST | `/api/search` | Chunk 级语义检索 |
+| POST | `/api/query` | RAG 对话（检索 + LLM 生成） |
+| POST | `/api/agent-query` | 跨文献 ReAct Agent |
+| POST | `/api/query_vision` | 截图多模态问答 |
+| GET | `/api/papers` | 论文列表 + 关联边（可视化用） |
+| GET | `/api/models` | 模型列表 |
+
+---
+
 ## 0. 本文结构（按需跳转）
 
 | 章节 | 内容 |
