@@ -161,6 +161,44 @@ class VectorStore:
     def chunks_count(self) -> int:
         return self._chunks_col.count()
 
+    def get_chunk(self, chunk_id: str) -> dict[str, Any] | None:
+        """按 chunk_id 取单个 chunk。返回 {chunk_id, paper_id, index, text} 或 None。"""
+        res = self._chunks_col.get(
+            ids=[chunk_id], include=["documents", "metadatas"]
+        )
+        if not res or not res.get("ids"):
+            return None
+        meta = (res.get("metadatas") or [{}])[0] or {}
+        doc = (res.get("documents") or [""])[0] or ""
+        return {
+            "chunk_id": chunk_id,
+            "paper_id": meta.get("paper_id"),
+            "index": int(meta.get("index", 0)),
+            "text": doc,
+        }
+
+    def get_paper_chunks(self, paper_id: str) -> list[dict[str, Any]]:
+        """取某篇论文的全部 chunk，按 index 升序。"""
+        res = self._chunks_col.get(
+            where={"paper_id": paper_id}, include=["documents", "metadatas"]
+        )
+        out: list[dict[str, Any]] = []
+        if res and res.get("ids"):
+            ids = res["ids"]
+            docs = res.get("documents") or [""] * len(ids)
+            metas = res.get("metadatas") or [{}] * len(ids)
+            for cid, doc, meta in zip(ids, docs, metas):
+                out.append(
+                    {
+                        "chunk_id": cid,
+                        "paper_id": (meta or {}).get("paper_id"),
+                        "index": int((meta or {}).get("index", 0)),
+                        "text": doc or "",
+                    }
+                )
+        out.sort(key=lambda x: x["index"])
+        return out
+
     # ------------------------------------------------------------------ #
     # 维护接口
     # ------------------------------------------------------------------ #

@@ -22,10 +22,16 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sklearn.metrics.pairwise import cosine_similarity
 
-from agent import build_agent, should_use_agent
+from agent import build_agent, classify_intent, should_use_agent
 from clustering import fallback_pos
 from config import FILES_DIR
-from llm_client import call_llm, encode_image_to_base64, is_vision_capable, test_connection
+from llm_client import (
+    call_llm,
+    call_llm_with_tools,
+    encode_image_to_base64,
+    is_vision_capable,
+    test_connection,
+)
 from models_registry import ModelsRegistry
 from text_processing import safe_stem
 
@@ -307,6 +313,117 @@ def _try_answer_meta_question(store, question: str) -> str | None:
         f"当前文献库共有 **{n} 篇**文献。{tail}"
         f"如果想看完整列表，可以问我「列出所有文献」。"
     )
+
+
+async def _rewrite_query(
+    cfg: dict[str, Any],
+    question: str,
+    history: list[Any] | None,
+) -> str:
+    """
+    检索前的查询改写：多轮指代消解 + 轻量术语补全。
+
+    只在「有对话历史」或「查询过短」时触发（这两种情况原始 query 向量化效果最差）。
+    任何异常或可疑输出都退回原始 question，保证不劣化。
+    返回用于检索/文献名匹配的查询（最终回答仍用原始 question）。
+    """
+    hist_lines: list[str] = []
+    for turn in (history or [])[-4:]:
+        role = (getattr(turn, "role", "") or "").lower()
+        text = (getattr(turn, "text", "") or "").strip()
+        if not text:
+            continue
+        who = "用户" if role in ("user", "human") else "助手"
+        hist_lines.append(f"{who}：{text[:300]}")
+    hist_block = "\n".join(hist_lines) if hist_lines else "（无历史）"
+
+    sys_prompt = (
+        "你是检索查询改写器。根据对话历史，把用户的最新问题改写成一个可以"
+        "独立用于文献向量检索的查询：\n"
+        "1) 消解指代：把『它/这个/上面那篇/前面说的』替换成历史里对应的具体对象；\n"
+        "2) 适当补全学术术语，让查询语义更完整，但严禁编造历史中不存在的信息；\n"
+        "3) 保持简洁，只输出改写后的查询本身，不要任何解释、前缀或引号。"
+    )
+    user_prompt = (
+        f"对话历史：\n{hist_block}\n\n"
+        f"用户最新问题：{question}\n\n"
+        f"改写后的检索查询："
+    )
+    try:
+        rewritten = await call_llm(
+            cfg,
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+        )
+    except Exception as e:
+        print(f"[api] query rewrite failed: {type(e).__name__}: {e}")
+        return question
+
+    rewritten = (rewritten or "").strip().strip('"""\u300c\u300d\'')
+    # 安全护栏：空 / 过长 / 模型答非所问 → 退回原问题
+    if not rewritten or len(rewritten) > 200:
+        return question
+    return rewritten
+
+
+async def _summarize_history(
+    cfg: dict[str, Any],
+    history: list[Any] | None,
+    keep_recent: int = 4,
+    trigger: int = 8,
+) -> tuple[str | None, list[dict[str, str]]]:
+    """
+    长对话摘要记忆（SummaryMemory）。
+
+    - 对话消息数 <= trigger：不压缩，原样返回（标准化为 {role,content} dict）。
+    - 超过 trigger：把较早的轮次用一次 LLM 调用压成 ≤200 字要点摘要，
+      与最近 keep_recent 条逐字保留，一起返回。
+    任何异常/可疑输出都退回「最近 6 条」滑动窗口，绝不破坏对话。
+    返回 (summary_text|None, recent_turns)。
+    """
+    norm: list[dict[str, str]] = []
+    for turn in (history or []):
+        role = (getattr(turn, "role", "") or "").lower().strip()
+        text = (getattr(turn, "text", "") or "").strip()
+        if not text:
+            continue
+        r = "assistant" if role in ("ai", "assistant", "model") else "user"
+        norm.append({"role": r, "content": text})
+
+    if len(norm) <= trigger:
+        return None, norm
+
+    older = norm[:-keep_recent]
+    recent = norm[-keep_recent:]
+    convo = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'][:400]}"
+        for m in older
+    )
+    sys_prompt = (
+        "你是对话记忆压缩器。把下面这段较早的对话压缩成简洁的中文要点摘要，"
+        "保留关键事实、已确认的结论、用户偏好、提到过的论文/概念；省略寒暄与重复。"
+        "控制在 200 字内，只输出摘要本身。"
+    )
+    try:
+        summary = await call_llm(
+            cfg,
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": convo},
+            ],
+            temperature=0.2,
+        )
+    except Exception as e:
+        print(f"[api] history summarize failed: {type(e).__name__}: {e}")
+        return None, norm[-6:]
+
+    summary = (summary or "").strip()
+    if not summary or len(summary) > 600:
+        return None, norm[-6:]
+    return summary, recent
 
 
 # ------------------------------------------------------------------ #
@@ -863,8 +980,16 @@ def create_app(store) -> FastAPI:
             toks = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,6}", t)
             return [x for x in toks if x not in _QUERY_STOPWORDS]
 
-        q_norm = _norm(question)
-        q_tokens = set(_tokens(question))
+        # ── 1.0 检索查询改写（多轮指代消解 + 短查询补全）─────────────────
+        # search_query 仅用于检索 / 文献名匹配；最终回答仍基于原始 question。
+        provider, cfg = _resolve_provider(body.provider)
+        search_query = question
+        if forced_mode != "chat" and (body.history or len(question) <= 8):
+            search_query = await _rewrite_query(cfg, question, body.history)
+
+        q_norm = _norm(search_query)
+        q_tokens = set(_tokens(search_query))
+        orig_q_tokens = set(_tokens(question))
         target_paper_id: str | None = None
 
         with store._lock:
@@ -916,12 +1041,12 @@ def create_app(store) -> FastAPI:
             pass
         elif target_paper_id:
             chunks, stat = store.search_chunks(
-                question, top_k=6, paper_id=target_paper_id, min_score=0.05
+                search_query, top_k=6, paper_id=target_paper_id, min_score=0.05
             )
             if stat != "ok":
-                chunks, stat = store.search_chunks(question, top_k=5)
+                chunks, stat = store.search_chunks(search_query, top_k=5)
         else:
-            chunks, stat = store.search_chunks(question, top_k=5)
+            chunks, stat = store.search_chunks(search_query, top_k=5)
 
         # ── 3. 自适应路由：看看检索质量如何 ──────────────────────────────
         def _sanitize_for_llm(text: str, max_len: int) -> str:
@@ -958,7 +1083,7 @@ def create_app(store) -> FastAPI:
         #   chat  - 完全没命中或极弱 → 通用对话，知道文献库里有哪些
         # 短问句且没有任何实质关键词（都被停用词过滤掉了）→ 视为闲聊
         #   - 避免"你是谁""谢谢""好的"等被误当成 RAG
-        is_chitchat_only = (not q_tokens) and len(question) <= 20
+        is_chitchat_only = (not orig_q_tokens) and len(question) <= 20
 
         # rag_soft 需要：语义分 ≥ 0.22 且至少有一个 chunk 质量 ≥ 0.5。
         # 避免"你了解 XXX 吗"这种和文献词面沾边、实际无关的问题被拖进 RAG。
@@ -1125,24 +1250,24 @@ def create_app(store) -> FastAPI:
             )
         user_content = "\n\n".join(user_parts)
 
-        # ── 5. 加入历史消息（多轮对话）──────────────────────────────────
+        # ── 5. 加入历史消息（多轮对话 + 长对话摘要记忆）──────────────────
+        # 短对话逐字带最近轮次；长对话把较早内容压成摘要，省 token 又不丢上下文。
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
-        history = body.history or []
-        # 只保留最近 6 条（3 轮对话），避免 context 过长
-        trimmed_history = history[-6:] if len(history) > 6 else list(history)
-        for turn in trimmed_history:
-            role = (turn.role or "").lower().strip()
-            text = _sanitize_for_llm(turn.text or "", 1500)
+        summary, recent_turns = await _summarize_history(cfg, body.history)
+        if summary:
+            messages.append({
+                "role": "system",
+                "content": "【早前对话摘要（已压缩）】\n" + summary,
+            })
+        for m in recent_turns:
+            text = _sanitize_for_llm(m["content"], 1500)
             if not text:
                 continue
-            if role in ("ai", "assistant", "model"):
-                messages.append({"role": "assistant", "content": text})
-            elif role in ("user", "human"):
-                messages.append({"role": "user", "content": text})
+            messages.append({"role": m["role"], "content": text})
         messages.append({"role": "user", "content": user_content})
 
         # ── 6. 调用 LLM ─────────────────────────────────────────────────
-        provider, cfg = _resolve_provider(body.provider)
+        # provider/cfg 已在步骤 1.0 解析（供查询改写复用），此处直接使用。
         try:
             temperature = 0.4 if mode == "rag" else 0.6
             answer = await call_llm(cfg, messages, temperature=temperature)
@@ -1211,33 +1336,44 @@ def create_app(store) -> FastAPI:
         if not question:
             return {"answer": "请输入问题。", "cites": [], "steps": [], "status": "ok", "message": ""}
 
-        if not body.force and not should_use_agent(question):
-            return {
-                "answer": "该问题适合普通 RAG，请使用 /api/query 接口。",
-                "cites": [],
-                "steps": [],
-                "status": "ok",
-                "message": "",
-            }
-
         provider, cfg = _resolve_provider(body.provider)
-
-        # 把历史转成 messages 格式（role: user/assistant）
-        history_msgs: list[dict[str, str]] = []
-        for turn in (body.history or [])[-6:]:
-            role = (turn.role or "").lower()
-            text = (turn.text or "").strip()
-            if not text:
-                continue
-            if role in ("ai", "assistant", "model"):
-                history_msgs.append({"role": "assistant", "content": text})
-            elif role in ("user", "human"):
-                history_msgs.append({"role": "user", "content": text})
 
         async def llm_fn(messages: list[dict], temperature: float = 0.3) -> str:
             return await call_llm(cfg, messages, temperature=temperature)
 
-        agent = build_agent(store, llm_fn)
+        # 路由：正则快筛先挡掉明显单篇问题，再用 LLM 意图分类兜底
+        if not body.force:
+            if should_use_agent(question):
+                intent = "multi"
+            else:
+                intent = await classify_intent(question, llm_fn)
+            if intent != "multi":
+                return {
+                    "answer": "该问题适合普通 RAG，请使用 /api/query 接口。",
+                    "cites": [],
+                    "steps": [],
+                    "status": "ok",
+                    "message": "",
+                }
+
+        # 把历史转成 messages 格式（含长对话摘要记忆）
+        history_msgs: list[dict[str, str]] = []
+        summary, recent_turns = await _summarize_history(cfg, body.history)
+        if summary:
+            history_msgs.append({
+                "role": "system",
+                "content": "【早前对话摘要（已压缩）】\n" + summary,
+            })
+        history_msgs.extend(recent_turns)
+
+        # 原生函数调用仅 OpenAI 兼容协议支持；Gemini 走文本 ReAct 回退
+        proto = str(cfg.get("protocol") or "openai").strip().lower()
+        llm_tool_fn = None
+        if proto != "gemini":
+            async def llm_tool_fn(messages: list[dict], tools: list[dict], temperature: float = 0.3) -> dict:
+                return await call_llm_with_tools(cfg, messages, tools, temperature=temperature)
+
+        agent = build_agent(store, llm_fn, llm_tool_fn=llm_tool_fn)
 
         try:
             result = await agent.run(question, history=history_msgs)
@@ -1252,10 +1388,27 @@ def create_app(store) -> FastAPI:
                 "message": _STATUS_MSG["llm_error"],
             }
 
+        # 从 Agent 收集的引用回填 cite_details（带页码，供前端跳转 PDF）
+        cite_details: list[dict[str, Any]] = []
+        for c in result.get("cites", []):
+            pid = c.get("paper_id")
+            cid = c.get("chunk_id")
+            if not pid:
+                continue
+            snippet, page_no = "", None
+            ctx = store.get_chunk_context(str(cid), window=0) if cid else None
+            if ctx and ctx.get("chunks"):
+                snippet = str(ctx["chunks"][0].get("text") or "")[:400]
+                page_no = store.locate_snippet_page(pid, snippet) if snippet else None
+            cite_details.append(
+                {"paper_id": pid, "chunk_id": cid, "snippet": snippet, "page": page_no}
+            )
+        cites = list(dict.fromkeys([c["paper_id"] for c in cite_details]))
+
         return {
             "answer": result["answer"],
-            "cites": [],
-            "cite_details": [],
+            "cites": cites,
+            "cite_details": cite_details,
             "steps": result.get("steps", []),
             "provider_used": provider,
             "mode": "agent",

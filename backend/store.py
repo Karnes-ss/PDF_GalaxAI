@@ -860,6 +860,32 @@ class ScholarStore:
                     return dict(p)
         return None
 
+    def get_chunk_context(
+        self, chunk_id: str, window: int = 1
+    ) -> dict[str, Any] | None:
+        """
+        取某个 chunk 及其前后相邻 chunk 的文本（按 index 邻近），
+        用于防止检索片段被切断导致断章取义。
+        返回 {paper_id, center_index, chunks:[{chunk_id,index,text}]} 或 None。
+        """
+        try:
+            vstore = self._ensure_vstore()
+        except Exception as e:
+            print(f"[store] get_chunk_context vstore error: {e}")
+            return None
+
+        info = vstore.get_chunk(chunk_id)
+        if not info or not info.get("paper_id"):
+            return None
+
+        paper_id = info["paper_id"]
+        center = int(info.get("index", 0))
+        ordered = vstore.get_paper_chunks(paper_id)
+        sel = [c for c in ordered if abs(int(c["index"]) - center) <= max(0, window)]
+        if not sel:
+            sel = [info]
+        return {"paper_id": paper_id, "center_index": center, "chunks": sel}
+
     def get_cleaned_fulltext(self, paper_id: str) -> str:
         """读取并清洗某篇论文的全文（供 LLM 摘要润色等上下文使用）。"""
         pdf_path = FILES_DIR / f"{paper_id}.pdf"

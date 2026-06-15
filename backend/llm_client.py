@@ -24,7 +24,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_openai import ChatOpenAI
 
 
@@ -164,6 +170,57 @@ def _to_lc_messages(
     return out
 
 
+def _to_lc_messages_tooling(
+    messages: list[dict[str, Any]],
+    vision: bool,
+) -> list[BaseMessage]:
+    """
+    与 _to_lc_messages 类似，但额外支持函数调用所需的两类消息：
+    - {"role":"assistant","content":..,"tool_calls":[{"id","name","args"}]}
+    - {"role":"tool","tool_call_id":..,"content":..}
+    其余普通消息走与文本路径一致的转换。
+    """
+    out: list[BaseMessage] = []
+    for m in messages:
+        role = m.get("role", "user")
+
+        if role == "tool":
+            out.append(
+                ToolMessage(
+                    content=str(m.get("content") or ""),
+                    tool_call_id=str(m.get("tool_call_id") or ""),
+                )
+            )
+            continue
+
+        if role == "assistant" and m.get("tool_calls"):
+            out.append(
+                AIMessage(
+                    content=str(m.get("content") or ""),
+                    tool_calls=[
+                        {
+                            "id": str(tc.get("id") or ""),
+                            "name": str(tc.get("name") or ""),
+                            "args": tc.get("args") or {},
+                        }
+                        for tc in m["tool_calls"]
+                    ],
+                )
+            )
+            continue
+
+        # 普通消息：复用既有展平/视觉转换逻辑
+        translated = _openai_translate_messages([m], vision=vision)[0]
+        content = translated.get("content", "")
+        if role == "system":
+            out.append(SystemMessage(content=content))
+        elif role == "assistant":
+            out.append(AIMessage(content=content))
+        else:
+            out.append(HumanMessage(content=content))
+    return out
+
+
 def _lc_content_to_text(content: Any) -> str:
     """把 LangChain 响应的 content（可能是 str 或分段列表）展平成纯文本。"""
     if isinstance(content, str):
@@ -215,6 +272,65 @@ async def _call_openai_compatible(
     if not answer:
         raise RuntimeError("LLM 返回空内容")
     return answer
+
+
+async def call_llm_with_tools(
+    cfg: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    temperature: float = 0.3,
+) -> dict[str, Any]:
+    """
+    原生函数调用（仅 OpenAI 兼容协议支持）。
+
+    tools: OpenAI function 格式列表，每项形如
+        {"type":"function","function":{"name","description","parameters":<json schema>}}
+    返回 {"content": str, "tool_calls": [{"id","name","args"}]}。
+    若 tools 为空则退化为普通调用（用于强制收尾时拿最终回答）。
+    """
+    proto = str(cfg.get("protocol") or "openai").strip().lower()
+    if proto == "gemini":
+        raise RuntimeError("Gemini 协议不支持原生函数调用，请走文本 ReAct 回退路径")
+
+    base_url = str(cfg.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("模型配置缺少 base_url")
+    model = str(cfg.get("model") or "")
+    if not model:
+        raise RuntimeError("模型配置缺少 model")
+    api_key = str(cfg.get("api_key") or "").strip() or "no-key"
+
+    lc_messages = _to_lc_messages_tooling(messages, vision=_is_vision_capable(cfg))
+
+    http_client = _build_client(cfg)
+    try:
+        llm = ChatOpenAI(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=temperature,
+            max_retries=2,
+            http_async_client=http_client,
+        )
+        if tools:
+            llm = llm.bind_tools(tools)
+        resp = await llm.ainvoke(lc_messages)
+    finally:
+        await http_client.aclose()
+
+    tool_calls: list[dict[str, Any]] = []
+    for tc in (getattr(resp, "tool_calls", None) or []):
+        tool_calls.append(
+            {
+                "id": str(tc.get("id") or ""),
+                "name": str(tc.get("name") or ""),
+                "args": tc.get("args") or {},
+            }
+        )
+    return {
+        "content": _lc_content_to_text(resp.content),
+        "tool_calls": tool_calls,
+    }
 
 
 async def _call_gemini(
